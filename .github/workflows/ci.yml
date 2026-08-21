@@ -1,0 +1,46 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: 0.16.0
+      - name: Format check
+        run: zig fmt --check src/
+      - name: Build
+        run: zig build
+      - name: Test
+        run: zig build test
+
+  commit-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Enforce six-word conventional commits
+        run: |
+          set -e
+          BASE="${{ github.event.pull_request.base.sha || github.push.before }}"
+          HEAD="${{ github.sha }}"
+          TYPES="feat|fix|docs|chore|refactor|test|ci|perf|build"
+          FAIL=0
+          while IFS= read -r subject; do
+            [ -z "$subject" ] && continue
+            if ! echo "$subject" | grep -qE "^($TYPES)(\([a-z0-9-]+\))?: [a-z0-9]+( [a-z0-9]+){5}$"; then
+              echo "BAD: $subject"
+              FAIL=1
+            fi
+          done < <(git log --format='%s' "$BASE".."$HEAD")
+          exit $FAIL
