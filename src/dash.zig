@@ -2,6 +2,7 @@ const std = @import("std");
 const http = std.http;
 const ports = @import("ports.zig");
 const kill_mod = @import("kill.zig");
+const containers_mod = @import("containers.zig");
 const scanner = @import("scanner.zig");
 
 pub const PortEntry = ports.PortEntry;
@@ -89,10 +90,12 @@ pub fn refreshOnce(io: std.Io) void {
 
     const open = scanner.scanRange(io, scratch, scan_range_start, scan_range_end, dashboard_port) catch return;
 
+    const cports = containers_mod.discover(io, scratch);
+
     const entries = ports.buildPortEntries(
         scratch,
         registered,
-        &.{},
+        cports,
         open,
         scan_range_start,
         scan_range_end,
