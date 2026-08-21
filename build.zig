@@ -77,4 +77,14 @@ pub fn build(b: *std.Build) void {
     const hosts_tests = b.addTest(.{ .root_module = hosts_mod });
     const run_hosts_tests = b.addRunArtifact(hosts_tests);
     test_step.dependOn(&run_hosts_tests.step);
+
+    const run_mod_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/run.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_run_tests = b.addRunArtifact(run_mod_tests);
+    test_step.dependOn(&run_run_tests.step);
 }
