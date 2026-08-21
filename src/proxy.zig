@@ -2,6 +2,7 @@ const std = @import("std");
 const http = std.http;
 const net = std.Io.net;
 const routes_mod = @import("routes.zig");
+const dash = @import("dash.zig");
 
 pub const version = "0.1.0";
 
@@ -71,7 +72,7 @@ fn serveConnection(stream: net.Stream, io: std.Io) !void {
             error.HttpConnectionClosing => return,
             else => return err,
         };
-        handleRequest(&request) catch |err| logErr("request failed", err);
+        handleRequest(&request, io) catch |err| logErr("request failed", err);
     }
 }
 
@@ -271,7 +272,34 @@ fn renderLoopPage(buf: []u8, raw_host: []const u8, hops: u32, port: ?u16) []cons
     return buf[0..used];
 }
 
-fn handleRequest(request: *http.Server.Request) !void {
+fn stripPort(raw_host: []const u8) []const u8 {
+    const lowered = routes_mod.normalizeAuthority(raw_host);
+    if (std.mem.lastIndexOfScalar(u8, lowered, ':')) |idx| {
+        if (idx + 1 < lowered.len) {
+            var digits = true;
+            for (lowered[idx + 1 ..]) |c| {
+                if (!std.ascii.isDigit(c)) digits = false;
+            }
+            if (digits) return lowered[0..idx];
+        }
+    }
+    return lowered;
+}
+
+/// Dashboard endpoints live on the bare loopback host only, so named
+/// app routes keep working: myapp.localhost/ still reaches the app.
+fn isDashboardTarget(target: []const u8, raw_host: []const u8) bool {
+    if (!std.mem.eql(u8, target, "/") and
+        !std.mem.startsWith(u8, target, "/events") and
+        !std.mem.startsWith(u8, target, "/api/")) return false;
+    const host = stripPort(raw_host);
+    inline for (.{ "localhost", "127.0.0.1", "::1", "[::1]" }) |ok| {
+        if (std.mem.eql(u8, host, ok)) return true;
+    }
+    return host.len == 0;
+}
+
+fn handleRequest(request: *http.Server.Request, io: std.Io) !void {
     const target = request.head.target;
 
     if (std.mem.eql(u8, target, "/healthz")) {
@@ -284,6 +312,14 @@ fn handleRequest(request: *http.Server.Request) !void {
 
     var host_buf: [256]u8 = undefined;
     const raw_host = findHeaderValue(request, "host", &host_buf) orelse "";
+
+    if (isDashboardTarget(target, raw_host)) {
+        try dash.handleDashboardRequest(request, io);
+        var tgt_buf: [128]u8 = undefined;
+        const tgt_kv = std.fmt.bufPrint(&tgt_buf, "target={s}", .{target}) catch "target=?";
+        logDebug("route served", &.{ "path=dash", tgt_kv });
+        return;
+    }
 
     var hops_buf: [16]u8 = undefined;
     const hops = parseHops(findHeaderValue(request, "x-berth-hops", &hops_buf) orelse "");

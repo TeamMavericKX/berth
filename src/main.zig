@@ -4,6 +4,7 @@ const db = @import("db.zig");
 const routes = @import("routes.zig");
 const hostsync = @import("hostsync.zig");
 const run_mod = @import("run.zig");
+const dash = @import("dash.zig");
 
 pub const version = proxy.version;
 
@@ -68,6 +69,7 @@ fn cmdServe(io: std.Io, init_gpa: std.mem.Allocator, env: *const std.process.Env
     if (loadStoredRoutes(io, init_gpa, env)) |live| {
         syncHostsFile(io, init_gpa, env, live);
     }
+    startDashboard(io, cfg.port);
     proxy.serve(io, cfg) catch |err| switch (err) {
         error.AddressInUse => std.process.exit(2),
         else => std.process.exit(2),
@@ -109,6 +111,91 @@ fn syncHostsFromStore(io: std.Io, gpa: std.mem.Allocator, env: *const std.proces
     const live = collectLiveRoutes(gpa) orelse return;
     defer gpa.free(live);
     syncHostsFile(io, gpa, env, live);
+}
+
+/// Dashboard view of registered apps: stored routes become entries with
+/// the ".localhost" suffix stripped, then apps-table rows override the
+/// display name/category for their port (or add standalone entries).
+/// Everything allocates from the caller's arena; nothing is freed here.
+fn provideRegistered(gpa: std.mem.Allocator) anyerror![]@import("ports.zig").RegisteredApp {
+    var out: std.ArrayList(@import("ports.zig").RegisteredApp) = .empty;
+    errdefer out.deinit(gpa);
+
+    if (run_store) |*s| {
+        const listed = try s.listRoutes(gpa);
+        for (listed) |r| {
+            try out.append(gpa, .{
+                .name = try gpa.dupe(u8, stripLocalhostSuffix(r.hostname)),
+                .port = r.port,
+                .category = "other",
+                .pid = r.pid,
+            });
+        }
+
+        const apps = try s.listApps(gpa);
+        for (apps) |app| {
+            var overridden = false;
+            for (out.items) |*existing| {
+                if (existing.port != app.port) continue;
+                // Explicit app rows win over hostname-derived names.
+                existing.name = app.name;
+                existing.category = app.category;
+                overridden = true;
+            }
+            if (!overridden) {
+                try out.append(gpa, .{
+                    .name = app.name,
+                    .port = app.port,
+                    .category = app.category,
+                    .pid = null,
+                });
+            }
+        }
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+fn stripLocalhostSuffix(hostname: []const u8) []const u8 {
+    if (std.mem.endsWith(u8, hostname, ".localhost")) {
+        return hostname[0 .. hostname.len - ".localhost".len];
+    }
+    return hostname;
+}
+
+/// Every stored category color for dashboard tag rendering.
+fn provideTagColors(gpa: std.mem.Allocator) anyerror![]db.TagColor {
+    const s = &(run_store orelse return &.{});
+    return s.listTagColors(gpa);
+}
+
+/// Persist dashboard edits: update the app row on port when present,
+/// otherwise insert a fresh one.
+fn editHook(gpa: std.mem.Allocator, port: u16, name: []const u8, category: []const u8) anyerror!void {
+    _ = gpa;
+    const s = &(run_store orelse return error.NoStore);
+    var name_buf: [256]u8 = undefined;
+    var cat_buf: [64]u8 = undefined;
+    if (s.findAppByPort(&name_buf, &cat_buf, port) catch null) |app| {
+        _ = try s.updateApp(app.id, name, port, category);
+        return;
+    }
+    _ = try s.insertApp(name, port, category);
+}
+
+/// Start the dashboard snapshot loop: one immediate publish so the page
+/// has data before the first scan tick, then refreshes every 5s.
+fn startDashboard(io: std.Io, cfg_port: u16) void {
+    dash.edit_hook = &editHook;
+    dash.registered_provider = &provideRegistered;
+    dash.tags_provider = &provideTagColors;
+    dash.dashboard_port = cfg_port;
+
+    const hub_ptr = dash.alloc.create(dash.Hub) catch return;
+    hub_ptr.* = .{ .io = io };
+    dash.setHub(hub_ptr);
+
+    const t = std.Thread.spawn(.{}, dash.refreshLoop, .{io}) catch return;
+    t.detach();
 }
 
 /// Seed the proxy's in-memory route table from ~/.berth/berth.db and keep

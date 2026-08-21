@@ -11,6 +11,12 @@ const sock_stream: c_uint = 1; // SOCK.STREAM on every posix we target
 /// Probe one port on loopback. IPv4 first; IPv6 is tried only when the
 /// IPv4 attempt fails, so services bound to ::1 alone are still found.
 pub fn probePort(io: std.Io, port: u16) bool {
+    // Raw-socket probing is POSIX-only; Windows support lands with a
+    // native winsock backend later.
+    switch (@import("builtin").os.tag) {
+        .windows => return false,
+        else => {},
+    }
     _ = io;
     if (tryConnect4(port)) return true;
     return tryConnect6(port);

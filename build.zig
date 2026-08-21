@@ -99,6 +99,18 @@ pub fn build(b: *std.Build) void {
     const run_scanner_tests = b.addRunArtifact(scanner_tests);
     test_step.dependOn(&run_scanner_tests.step);
 
+    const dash_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/dash.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    linkSqlite(b, dash_tests.root_module);
+    const run_dash_tests = b.addRunArtifact(dash_tests);
+    test_step.dependOn(&run_dash_tests.step);
+
     const ports_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/ports.zig"),

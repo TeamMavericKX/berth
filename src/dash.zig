@@ -1,0 +1,495 @@
+const std = @import("std");
+const http = std.http;
+const ports = @import("ports.zig");
+const scanner = @import("scanner.zig");
+
+pub const PortEntry = ports.PortEntry;
+
+pub const html = @embedFile("dash.html");
+
+/// The dashboard owns one process-wide allocation domain. Everything it
+/// touches allocates here, never through a caller-supplied allocator:
+/// the refresh thread, request threads and mutation handlers all share
+/// this state, so a single thread-safe domain is part of the contract.
+///
+/// Two pools with different lifetimes:
+///   * `alloc` (plain page allocator) for values that escape a tick,
+///     namely the published JSON payload, plus isolated request-scoped
+///     reads on API threads (/proc tables, pid walks).
+///   * `scratch` arena for everything inside one refresh tick (provider
+///     rows, scan results, entry list, rendered text). Reset after each
+///     render, so provider results only need to outlive the callback.
+pub const alloc: std.mem.Allocator = std.heap.page_allocator;
+var scratch_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+
+/// Injected by serve: returns registered apps from the route store.
+/// Implementations allocate from the passed allocator; the memory only
+/// needs to stay valid until the next refresh begins.
+pub var registered_provider: ?*const fn (gpa: std.mem.Allocator) anyerror![]ports.RegisteredApp = null;
+
+/// The port serve itself listens on; excluded from scan results.
+pub const dashboard_port_default: u16 = 8080;
+
+pub var dashboard_port: u16 = dashboard_port_default;
+
+pub const scan_range_start = 1000;
+pub const scan_range_end = 9999;
+
+/// Latest rendered snapshot plus a generation counter bumped on every
+/// publish so SSE clients detect changes by polling once per second.
+pub const Hub = struct {
+    mutex: std.Io.Mutex = .init,
+    generation: u64 = 0,
+    payload: []u8 = &.{},
+    io: std.Io,
+
+    pub fn publish(self: *Hub, json: []u8) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.payload.len > 0) alloc.free(self.payload);
+        self.payload = json;
+        self.generation += 1;
+    }
+
+    fn current(self: *Hub) struct { gen: u64, payload: []const u8 } {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return .{ .gen = self.generation, .payload = self.payload };
+    }
+};
+
+var hub_instance: ?*Hub = null;
+
+pub fn setHub(h: *Hub) void {
+    hub_instance = h;
+}
+
+fn hub() *Hub {
+    return hub_instance.?;
+}
+
+/// Build entries from providers + a live scan and publish. Runs on the
+/// refresh thread and after every mutation.
+pub fn refreshOnce(io: std.Io) void {
+    const scratch = scratch_state.allocator();
+    defer _ = scratch_state.reset(.retain_capacity);
+
+    var registered: []ports.RegisteredApp = &.{};
+    if (registered_provider) |provider| {
+        registered = provider(scratch) catch &.{};
+    }
+    var tags: []db.TagColor = &.{};
+    if (tags_provider) |provider| {
+        tags = provider(scratch) catch &.{};
+    }
+
+    const open = scanner.scanRange(io, scratch, scan_range_start, scan_range_end, dashboard_port) catch return;
+
+    const entries = ports.buildPortEntries(
+        scratch,
+        registered,
+        &.{},
+        open,
+        scan_range_start,
+        scan_range_end,
+    ) catch return;
+
+    var alloc_writer = std.Io.Writer.Allocating.init(scratch);
+    defer alloc_writer.deinit();
+    renderEntriesJson(&alloc_writer.writer, entries, tags) catch return;
+
+    // Only the payload escapes the tick; give it a stable home.
+    const json = alloc.dupe(u8, alloc_writer.written()) catch return;
+    hub().publish(json);
+}
+
+/// Refresh thread body: initial snapshot immediately, then every 5s.
+pub fn refreshLoop(io: std.Io) void {
+    while (true) {
+        refreshOnce(io);
+        io.sleep(.fromMilliseconds(5000), .real) catch return;
+    }
+}
+
+/// Render entries as the SSE data payload. Pure for unit tests.
+pub fn renderEntriesJson(
+    writer: *std.Io.Writer,
+    entries: []const PortEntry,
+    tags: []const db.TagColor,
+) !void {
+    try writer.writeAll("{\"tags\":{");
+    for (tags, 0..) |t, i| {
+        if (i > 0) try writer.writeAll(",");
+        try writeJsonString(writer, t.category);
+        try writer.writeAll(":");
+        try writeJsonString(writer, t.color);
+    }
+    try writer.writeAll("},\"entries\":[");
+    for (entries, 0..) |e, i| {
+        if (i > 0) try writer.writeAll(",");
+        try writer.print("{{\"port\":{d},\"name\":", .{e.port});
+        try writeJsonString(writer, e.name);
+        try writer.writeAll(",\"category\":");
+        try writeJsonString(writer, e.category);
+        try writer.print(",\"origin\":\"{s}\",\"alive\":{},\"pid\":", .{ e.origin.label(), e.alive });
+        if (e.pid) |pid| {
+            try writer.print("{d}", .{pid});
+        } else {
+            try writer.writeAll("null");
+        }
+        try writer.writeAll("}");
+    }
+    try writer.writeAll("]}");
+}
+
+pub fn writeJsonString(writer: *std.Io.Writer, s: []const u8) !void {
+    try writer.writeByte('"');
+    for (s) |ch| switch (ch) {
+        '"' => try writer.writeAll("\\\""),
+        '\\' => try writer.writeAll("\\\\"),
+        '\n' => try writer.writeAll("\\n"),
+        '\r' => try writer.writeAll("\\r"),
+        '\t' => try writer.writeAll("\\t"),
+        else => {
+            if (ch < 0x20) {
+                try writer.print("\\u{x:0>4}", .{ch});
+            } else {
+                try writer.writeByte(ch);
+            }
+        },
+    };
+    try writer.writeByte('"');
+}
+
+/// Single entry point for every dashboard endpoint: "/" serves the
+/// embedded HTML, "/events" the SSE stream, "/api/*" data + mutations.
+pub fn handleDashboardRequest(request: *http.Server.Request, io: std.Io) !void {
+    // Match paths without their query string.
+    const path = if (std.mem.indexOfScalar(u8, request.head.target, '?')) |q|
+        request.head.target[0..q]
+    else
+        request.head.target;
+    const target = path;
+
+    if (std.mem.eql(u8, target, "/")) {
+        if (request.head.method != .GET) {
+            return request.respond("method not allowed\n", .{ .status = .method_not_allowed, .keep_alive = false });
+        }
+        try request.respond(html, .{
+            .extra_headers = &.{.{ .name = "content-type", .value = "text/html; charset=utf-8" }},
+        });
+        return;
+    }
+
+    if (std.mem.startsWith(u8, target, "/events")) {
+        if (request.head.method != .GET) {
+            return request.respond("method not allowed\n", .{ .status = .method_not_allowed, .keep_alive = false });
+        }
+        return handleEvents(request, io);
+    }
+    if (std.mem.eql(u8, target, "/api/ports")) {
+        return handleApiPorts(request);
+    }
+    if (std.mem.eql(u8, target, "/api/kill")) {
+        return handleApiKill(io, request);
+    }
+    if (std.mem.eql(u8, target, "/api/edit")) {
+        return handleApiEdit(io, request);
+    }
+    try request.respond("not found\n", .{ .status = .not_found, .keep_alive = false });
+}
+
+/// SSE stream: initial snapshot, then scan events on generation change
+/// (polled at 1s, so mutations land within one second) and a keepalive
+/// comment every 15s. Exits when the client disconnects.
+pub fn handleEvents(request: *http.Server.Request, io: std.Io) !void {
+    var buffer: [16 * 1024]u8 = undefined;
+    var body_writer = try request.respondStreaming(&buffer, .{ .respond_options = .{
+        .extra_headers = &.{
+            .{ .name = "content-type", .value = "text/event-stream" },
+            .{ .name = "cache-control", .value = "no-cache" },
+        },
+    } });
+    const w = &body_writer.writer;
+
+    try w.writeAll("retry: 3000\n\n");
+    // Force the first snapshot out immediately.
+    var last_sent: u64 = hub().current().gen +% 1;
+    // Keepalive cadence is independent of scan traffic so a quiet
+    // server still proves the stream is alive every 15 seconds.
+    var since_keepalive: usize = 0;
+    var scratch: [32 * 1024]u8 = undefined;
+
+    while (true) {
+        const snap = hub().current();
+        if (snap.gen != last_sent) {
+            last_sent = snap.gen;
+            const n = @min(snap.payload.len, scratch.len);
+            @memcpy(scratch[0..n], snap.payload[0..n]);
+            w.print("event: scan\ndata: {s}\n\n", .{scratch[0..n]}) catch return;
+            w.flush() catch return;
+            body_writer.flush() catch return;
+        }
+        io.sleep(.fromMilliseconds(1000), .real) catch return;
+        since_keepalive += 1;
+        if (since_keepalive >= 15) {
+            since_keepalive = 0;
+            w.writeAll(": keepalive\n\n") catch return;
+            w.flush() catch return;
+            body_writer.flush() catch return;
+        }
+    }
+}
+
+/// Injected by serve: every stored category color. Arena-backed like
+/// registered_provider.
+pub var tags_provider: ?*const fn (gpa: std.mem.Allocator) anyerror![]db.TagColor = null;
+
+pub const db = @import("db.zig");
+
+/// Hook wired by serve: persists name/category for the app on port.
+pub var edit_hook: ?*const fn (
+    gpa: std.mem.Allocator,
+    port: u16,
+    name: []const u8,
+    category: []const u8,
+) anyerror!void = null;
+
+/// Extract a decimal query param value from a raw target like
+/// "/api/kill?port=4300". Returns null when absent or malformed.
+pub fn queryParam(target: []const u8, key: []const u8, buf: []u8) ?[]const u8 {
+    var rest = target;
+    while (std.mem.indexOfScalar(u8, rest, '?')) |q| {
+        rest = rest[q + 1 ..];
+        var pairs = std.mem.splitScalar(u8, rest, '&');
+        while (pairs.next()) |pair| {
+            const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+            if (std.mem.eql(u8, pair[0..eq], key)) {
+                const n = @min(pair[eq + 1 ..].len, buf.len);
+                @memcpy(buf[0..n], pair[eq + 1 ..][0..n]);
+                return buf[0..n];
+            }
+        }
+        return null;
+    }
+    return null;
+}
+
+/// POST /api/ports returns the current snapshot; POST /api/kill sends
+/// SIGTERM to the listener on port. Both re-publish so streams see the
+/// change within one second.
+pub fn handleApiKill(io: std.Io, request: *http.Server.Request) !void {
+    var qbuf: [32]u8 = undefined;
+    const port_str = queryParam(request.head.target, "port", &qbuf) orelse {
+        return request.respond("missing port\n", .{ .status = .bad_request, .keep_alive = false });
+    };
+    const port = std.fmt.parseInt(u16, port_str, 10) catch {
+        return request.respond("bad port\n", .{ .status = .bad_request, .keep_alive = false });
+    };
+
+    var killed = false;
+    if (findListenerPid(io, port)) |pid| {
+        switch (@import("builtin").os.tag) {
+            .windows => {},
+            else => {
+                std.posix.kill(pid, .TERM) catch {};
+                killed = true;
+            },
+        }
+    }
+    refreshOnce(io);
+    const body: []const u8 = if (killed) "killed\n" else "no listener\n";
+    try request.respond(body, .{
+        .status = if (killed) .ok else .not_found,
+        .keep_alive = false,
+        .extra_headers = &.{.{ .name = "content-type", .value = "text/plain" }},
+    });
+}
+
+pub fn handleApiEdit(io: std.Io, request: *http.Server.Request) !void {
+    var qbuf: [128]u8 = undefined;
+    var nbuf: [128]u8 = undefined;
+    var cbuf: [64]u8 = undefined;
+    const port_str = queryParam(request.head.target, "port", &qbuf) orelse {
+        return request.respond("missing port\n", .{ .status = .bad_request, .keep_alive = false });
+    };
+    const port = std.fmt.parseInt(u16, port_str, 10) catch {
+        return request.respond("bad port\n", .{ .status = .bad_request, .keep_alive = false });
+    };
+    const name = queryParam(request.head.target, "name", &nbuf) orelse "";
+    const category = queryParam(request.head.target, "category", &cbuf) orelse "other";
+
+    const hook = edit_hook orelse {
+        return request.respond("no store\n", .{ .status = .internal_server_error, .keep_alive = false });
+    };
+    hook(alloc, port, name, category) catch {
+        return request.respond("save failed\n", .{ .status = .conflict, .keep_alive = false });
+    };
+    refreshOnce(io);
+    try request.respond("saved\n", .{ .keep_alive = false });
+}
+
+pub fn handleApiPorts(request: *http.Server.Request) !void {
+    const snap = hub().current();
+    try request.respond(snap.payload, .{
+        .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }},
+    });
+}
+
+/// Find the pid owning the listening socket on port by walking
+/// /proc/net/tcp then matching socket inodes under /proc/[pid]/fd.
+/// Linux only; other platforms return null.
+pub fn findListenerPid(io: std.Io, port: u16) ?i32 {
+    switch (@import("builtin").os.tag) {
+        .linux => {},
+        else => return null,
+    }
+
+    var inode_buf: [32]u8 = undefined;
+    const inode_len = findListenInode(port, &inode_buf) orelse return null;
+    return findPidForInode(io, inode_buf[0..inode_len]);
+}
+
+fn readProcTable(path: [*:0]const u8) ?[]u8 {
+    const fd = std.c.open(path, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (fd < 0) return null;
+    defer _ = std.c.close(fd);
+
+    // readFileAlloc and streamRemaining both yield zero bytes for
+    // procfs files because st_size is 0; a raw read loop is reliable.
+    var list: std.ArrayList(u8) = .empty;
+    var chunk: [64 * 1024]u8 = undefined;
+    while (true) {
+        const n = std.c.read(fd, &chunk, chunk.len);
+        if (n <= 0) break;
+        list.appendSlice(alloc, chunk[0..@intCast(n)]) catch {
+            alloc.free(list.items);
+            return null;
+        };
+    }
+    return list.toOwnedSlice(alloc) catch null;
+}
+
+/// Returns the copied inode length, or null when no listener exists.
+fn findListenInode(port: u16, inode_out: []u8) ?usize {
+    const tables = [_][*:0]const u8{ "/proc/net/tcp", "/proc/net/tcp6" };
+    for (tables) |path| {
+        const bytes = readProcTable(path) orelse continue;
+        defer alloc.free(bytes);
+
+        var lines = std.mem.splitScalar(u8, bytes, '\n');
+        _ = lines.next(); // header
+        while (lines.next()) |line| {
+            var local_port: u16 = 0;
+            var state: []const u8 = "";
+            var inode: []const u8 = "";
+            var idx: usize = 0;
+            var cols = std.mem.splitScalar(u8, std.mem.trim(u8, line, " "), ' ');
+            while (cols.next()) |raw| {
+                // /proc/net/tcp pads columns with extra spaces; treat
+                // runs of separators as one or every index shifts.
+                if (raw.len == 0) continue;
+                switch (idx) {
+                    1 => {
+                        const colon = std.mem.lastIndexOfScalar(u8, raw, ':') orelse break;
+                        local_port = std.fmt.parseInt(u16, raw[colon + 1 ..], 16) catch break;
+                    },
+                    3 => state = raw,
+                    9 => inode = raw,
+                    else => {},
+                }
+                idx += 1;
+            }
+            if (local_port == port and std.mem.eql(u8, state, "0A")) {
+                const n = @min(inode.len, inode_out.len);
+                @memcpy(inode_out[0..n], inode[0..n]);
+                return n;
+            }
+        }
+    }
+    return null;
+}
+
+fn findPidForInode(io: std.Io, inode: []const u8) ?i32 {
+    const proc_dir = std.Io.Dir.cwd().openDir(io, "/proc", .{ .iterate = true }) catch return null;
+    defer proc_dir.close(io);
+
+    var needle_buf: [64]u8 = undefined;
+    const needle = std.fmt.bufPrint(&needle_buf, "socket:[{s}]", .{inode}) catch return null;
+
+    var it = proc_dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        // procfs reports DT_UNKNOWN for directories; filter by name only.
+        const pid = std.fmt.parseInt(i32, entry.name, 10) catch continue;
+
+        var fd_path: [64]u8 = undefined;
+        const fd_dir_path = std.fmt.bufPrint(&fd_path, "/proc/{d}/fd", .{pid}) catch continue;
+        var fd_dir = std.Io.Dir.openDirAbsolute(io, fd_dir_path, .{ .iterate = true }) catch continue;
+        defer fd_dir.close(io);
+
+        var fd_it = fd_dir.iterate();
+        while (fd_it.next(io) catch null) |fd_entry| {
+            var target: [256]u8 = undefined;
+            const n = fd_dir.readLink(io, fd_entry.name, &target) catch continue;
+            if (std.mem.eql(u8, target[0..n], needle)) return pid;
+        }
+    }
+    return null;
+}
+
+test "json snapshot renders entries with escaping and pid null" {
+    var buf: [2048]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    const entries = [_]PortEntry{
+        .{ .port = 4300, .name = "my app", .category = "web", .origin = .registered, .alive = true, .pid = 42 },
+        .{ .port = 4400, .origin = .anonymous, .alive = false },
+    };
+    const tags = [_]db.TagColor{.{ .category = "web", .color = "#2563eb" }};
+    try renderEntriesJson(&writer, entries[0..], tags[0..]);
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "\"tags\":{\"web\":\"#2563eb\"}") != null);
+
+    const out = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"port\":4300") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"name\":\"my app\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"origin\":\"registered\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"alive\":true,\"pid\":42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"origin\":\"anonymous\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"pid\":null") != null);
+}
+
+test "json string escapes quotes and control chars" {
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try writeJsonString(&writer, "a\"b\\c\nd\x01");
+    try std.testing.expectEqualStrings("\"a\\\"b\\\\c\\nd\\u0001\"", writer.buffered());
+}
+
+test "query param extracts port and name" {
+    var buf: [64]u8 = undefined;
+    const t = "/api/kill?port=4300";
+    try std.testing.expectEqualStrings("4300", queryParam(t, "port", &buf).?);
+    const t2 = "/api/edit?port=4300&name=my%20app&category=web";
+    try std.testing.expectEqualStrings("4300", queryParam(t2, "port", &buf).?);
+    try std.testing.expectEqualStrings("my%20app", queryParam(t2, "name", &buf).?);
+    try std.testing.expectEqualStrings("web", queryParam(t2, "category", &buf).?);
+    try std.testing.expectEqual(@as(?[]const u8, null), queryParam("/api/kill", "port", &buf));
+}
+
+test "find listener pid locates own listening socket" {
+    const builtin = @import("builtin");
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const io = std.testing.io;
+    const net = std.Io.net;
+    const addr = net.IpAddress.parseIp4("127.0.0.1", 46701) catch unreachable;
+    var holder = addr.listen(io, .{}) catch return error.SkipZigTest;
+    defer holder.deinit(io);
+
+    const own_pid: i32 = switch (builtin.os.tag) {
+        .linux => @intCast(std.os.linux.getpid()),
+        else => unreachable,
+    };
+    const found = findListenerPid(io, 46701);
+    try std.testing.expectEqual(@as(?i32, own_pid), found);
+    try std.testing.expectEqual(@as(?i32, null), findListenerPid(io, 46702));
+}
