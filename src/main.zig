@@ -1,17 +1,76 @@
 const std = @import("std");
+const proxy = @import("proxy.zig");
 
-pub const version = "0.1.0";
+pub const version = proxy.version;
 
-pub fn main(init: std.process.Init.Minimal) !void {
-    var it = try std.process.Args.Iterator.initAllocator(init.args, std.heap.page_allocator);
+pub fn main(init: std.process.Init) !void {
+    var it = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa);
     defer it.deinit();
     _ = it.skip();
 
-    if (it.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--version")) return printVersion();
-        if (std.mem.eql(u8, arg, "--help")) return printHelp();
+    // Logging gate: debug lines exist only when BERTH_LOG asks for them.
+    if (init.environ_map.get("BERTH_LOG") != null) {
+        proxy.debug_enabled = true;
     }
-    try printVersion();
+
+    const cmd = it.next() orelse return printHelp();
+
+    if (std.mem.eql(u8, cmd, "--version") or std.mem.eql(u8, cmd, "version")) {
+        return printVersion();
+    }
+    if (std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "help")) {
+        return printHelp();
+    }
+    if (std.mem.eql(u8, cmd, "serve")) {
+        return cmdServe(init.io, init.gpa, &it);
+    }
+
+    usageFail("unknown command", cmd);
+}
+
+fn cmdServe(io: std.Io, _: std.mem.Allocator, it: *std.process.Args.Iterator) !void {
+    var cfg = proxy.Config{};
+
+    while (it.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--port")) {
+            const raw = it.next() orelse {
+                usageFail("--port requires a number", "");
+            };
+            cfg.port = std.fmt.parseInt(u16, raw, 10) catch {
+                usageFail("port must be a number between 1 and 65535", raw);
+            };
+        } else if (std.mem.eql(u8, arg, "--host")) {
+            cfg.host = it.next() orelse usageFail("--host requires an address", "");
+        } else {
+            usageFail("unknown flag for serve", arg);
+        }
+    }
+
+    // Loopback refusal is a usage error: the user asked for something
+    // berth refuses by design. Exit 1 per docs/conventions.md.
+    if (proxy.configRefusal(cfg)) |host| {
+        std.debug.print(
+            \\cannot bind {s}: berth binds loopback only
+            \\  non-loopback exposure arrives later as an explicit flag.
+            \\  use 127.0.0.1, ::1, or localhost
+            \\
+        , .{host});
+        std.process.exit(1);
+    }
+
+    proxy.serve(io, cfg) catch |err| switch (err) {
+        error.AddressInUse => std.process.exit(2),
+        else => std.process.exit(2),
+    };
+}
+
+fn usageFail(msg: []const u8, detail: []const u8) noreturn {
+    if (detail.len > 0) {
+        std.debug.print("{s}: '{s}'\n  run: berth --help\n", .{ msg, detail });
+    } else {
+        std.debug.print("{s}\n  run: berth --help\n", .{msg});
+    }
+    std.process.exit(1);
 }
 
 fn printVersion() !void {
@@ -22,10 +81,13 @@ fn printHelp() !void {
     std.debug.print(
         \\berth {s} - one daemon, both worlds
         \\
-        \\usage: berth [--version] [--help]
+        \\usage:
+        \\  berth serve [--host 127.0.0.1] [--port 8080]   run the proxy (loopback only)
+        \\  berth version                                  print version
+        \\  berth help                                     this text
         \\
-        \\pre-alpha: the proxy, scanner, and dashboard arrive milestone by
-        \\milestone. see the repository issue tracker for the build plan.
+        \\the proxy routes by Host header; named URLs arrive in M1.
+        \\agents: markdown endpoints arrive in M2.
         \\
     , .{version});
 }
