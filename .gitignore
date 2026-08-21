@@ -4,3 +4,4 @@ zig-out/
 *.sha256
 dist/
 .DS_Store
+*.core

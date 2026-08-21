@@ -26,9 +26,18 @@ const schema_sql =
     \\) STRICT, WITHOUT ROWID;
 ;
 
-fn transient() c.sqlite3_destructor_type {
-    return @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
-}
+/// SQLITE_TRANSIENT is ((void*)-1), which no Zig pointer type can hold on
+/// aarch64 without tripping alignment checks. Declaring the bind with an
+/// isize destructor slot keeps the ABI honest and the cast trivial.
+const transient_sentinel: isize = -1;
+
+extern fn sqlite3_bind_text(
+    stmt: ?*c.sqlite3_stmt,
+    idx: c_int,
+    data: [*]const u8,
+    byte_len: c_int,
+    destructor: isize,
+) c_int;
 
 fn diag(db: ?*c.sqlite3) []const u8 {
     const msg = c.sqlite3_errmsg(db);
@@ -43,7 +52,7 @@ fn check(rc: c_int, db: ?*c.sqlite3) Error!void {
 }
 
 fn bindText(stmt: ?*c.sqlite3_stmt, idx: c_int, text: []const u8) Error!void {
-    const rc = c.sqlite3_bind_text(stmt, idx, text.ptr, @intCast(text.len), transient());
+    const rc = sqlite3_bind_text(stmt, idx, text.ptr, @intCast(text.len), transient_sentinel);
     if (rc != c.SQLITE_OK) return error.DbFailed;
 }
 
