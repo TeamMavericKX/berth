@@ -89,7 +89,7 @@ function openMenu(ev, entry) {
     closeMenu();
     if (!confirm(`Kill the process on port ${entry.port}?`)) return;
     const res = await fetch(`/api/kill?port=${entry.port}`, { method: 'POST' });
-    toast(res.ok ? `Sent SIGTERM to port ${entry.port}` : `Could not kill port ${entry.port}`);
+    toast(res.ok ? `Port ${entry.port}: ${(await res.text()).trim()}` : `Could not kill port ${entry.port}`);
   };
   menu.append(edit, kill);
   menu.style.display = 'block';

@@ -1,6 +1,7 @@
 const std = @import("std");
 const http = std.http;
 const ports = @import("ports.zig");
+const kill_mod = @import("kill.zig");
 const scanner = @import("scanner.zig");
 
 pub const PortEntry = ports.PortEntry;
@@ -287,20 +288,13 @@ pub fn handleApiKill(io: std.Io, request: *http.Server.Request) !void {
         return request.respond("bad port\n", .{ .status = .bad_request, .keep_alive = false });
     };
 
-    var killed = false;
-    if (findListenerPid(io, port)) |pid| {
-        switch (@import("builtin").os.tag) {
-            .windows => {},
-            else => {
-                std.posix.kill(pid, .TERM) catch {};
-                killed = true;
-            },
-        }
-    }
+    const result = switch (@import("builtin").os.tag) {
+        .windows => kill_mod.Result.not_found,
+        else => kill_mod.killPort(io, alloc, port, .{}),
+    };
     refreshOnce(io);
-    const body: []const u8 = if (killed) "killed\n" else "no listener\n";
-    try request.respond(body, .{
-        .status = if (killed) .ok else .not_found,
+    try request.respond(result.label(), .{
+        .status = result.status(),
         .keep_alive = false,
         .extra_headers = &.{.{ .name = "content-type", .value = "text/plain" }},
     });
@@ -334,107 +328,6 @@ pub fn handleApiPorts(request: *http.Server.Request) !void {
     try request.respond(snap.payload, .{
         .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }},
     });
-}
-
-/// Find the pid owning the listening socket on port by walking
-/// /proc/net/tcp then matching socket inodes under /proc/[pid]/fd.
-/// Linux only; other platforms return null.
-pub fn findListenerPid(io: std.Io, port: u16) ?i32 {
-    switch (@import("builtin").os.tag) {
-        .linux => {},
-        else => return null,
-    }
-
-    var inode_buf: [32]u8 = undefined;
-    const inode_len = findListenInode(port, &inode_buf) orelse return null;
-    return findPidForInode(io, inode_buf[0..inode_len]);
-}
-
-fn readProcTable(path: [*:0]const u8) ?[]u8 {
-    const fd = std.c.open(path, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
-    if (fd < 0) return null;
-    defer _ = std.c.close(fd);
-
-    // readFileAlloc and streamRemaining both yield zero bytes for
-    // procfs files because st_size is 0; a raw read loop is reliable.
-    var list: std.ArrayList(u8) = .empty;
-    var chunk: [64 * 1024]u8 = undefined;
-    while (true) {
-        const n = std.c.read(fd, &chunk, chunk.len);
-        if (n <= 0) break;
-        list.appendSlice(alloc, chunk[0..@intCast(n)]) catch {
-            alloc.free(list.items);
-            return null;
-        };
-    }
-    return list.toOwnedSlice(alloc) catch null;
-}
-
-/// Returns the copied inode length, or null when no listener exists.
-fn findListenInode(port: u16, inode_out: []u8) ?usize {
-    const tables = [_][*:0]const u8{ "/proc/net/tcp", "/proc/net/tcp6" };
-    for (tables) |path| {
-        const bytes = readProcTable(path) orelse continue;
-        defer alloc.free(bytes);
-
-        var lines = std.mem.splitScalar(u8, bytes, '\n');
-        _ = lines.next(); // header
-        while (lines.next()) |line| {
-            var local_port: u16 = 0;
-            var state: []const u8 = "";
-            var inode: []const u8 = "";
-            var idx: usize = 0;
-            var cols = std.mem.splitScalar(u8, std.mem.trim(u8, line, " "), ' ');
-            while (cols.next()) |raw| {
-                // /proc/net/tcp pads columns with extra spaces; treat
-                // runs of separators as one or every index shifts.
-                if (raw.len == 0) continue;
-                switch (idx) {
-                    1 => {
-                        const colon = std.mem.lastIndexOfScalar(u8, raw, ':') orelse break;
-                        local_port = std.fmt.parseInt(u16, raw[colon + 1 ..], 16) catch break;
-                    },
-                    3 => state = raw,
-                    9 => inode = raw,
-                    else => {},
-                }
-                idx += 1;
-            }
-            if (local_port == port and std.mem.eql(u8, state, "0A")) {
-                const n = @min(inode.len, inode_out.len);
-                @memcpy(inode_out[0..n], inode[0..n]);
-                return n;
-            }
-        }
-    }
-    return null;
-}
-
-fn findPidForInode(io: std.Io, inode: []const u8) ?i32 {
-    const proc_dir = std.Io.Dir.cwd().openDir(io, "/proc", .{ .iterate = true }) catch return null;
-    defer proc_dir.close(io);
-
-    var needle_buf: [64]u8 = undefined;
-    const needle = std.fmt.bufPrint(&needle_buf, "socket:[{s}]", .{inode}) catch return null;
-
-    var it = proc_dir.iterate();
-    while (it.next(io) catch null) |entry| {
-        // procfs reports DT_UNKNOWN for directories; filter by name only.
-        const pid = std.fmt.parseInt(i32, entry.name, 10) catch continue;
-
-        var fd_path: [64]u8 = undefined;
-        const fd_dir_path = std.fmt.bufPrint(&fd_path, "/proc/{d}/fd", .{pid}) catch continue;
-        var fd_dir = std.Io.Dir.openDirAbsolute(io, fd_dir_path, .{ .iterate = true }) catch continue;
-        defer fd_dir.close(io);
-
-        var fd_it = fd_dir.iterate();
-        while (fd_it.next(io) catch null) |fd_entry| {
-            var target: [256]u8 = undefined;
-            const n = fd_dir.readLink(io, fd_entry.name, &target) catch continue;
-            if (std.mem.eql(u8, target[0..n], needle)) return pid;
-        }
-    }
-    return null;
 }
 
 test "json snapshot renders entries with escaping and pid null" {
@@ -473,23 +366,4 @@ test "query param extracts port and name" {
     try std.testing.expectEqualStrings("my%20app", queryParam(t2, "name", &buf).?);
     try std.testing.expectEqualStrings("web", queryParam(t2, "category", &buf).?);
     try std.testing.expectEqual(@as(?[]const u8, null), queryParam("/api/kill", "port", &buf));
-}
-
-test "find listener pid locates own listening socket" {
-    const builtin = @import("builtin");
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
-
-    const io = std.testing.io;
-    const net = std.Io.net;
-    const addr = net.IpAddress.parseIp4("127.0.0.1", 46701) catch unreachable;
-    var holder = addr.listen(io, .{}) catch return error.SkipZigTest;
-    defer holder.deinit(io);
-
-    const own_pid: i32 = switch (builtin.os.tag) {
-        .linux => @intCast(std.os.linux.getpid()),
-        else => unreachable,
-    };
-    const found = findListenerPid(io, 46701);
-    try std.testing.expectEqual(@as(?i32, own_pid), found);
-    try std.testing.expectEqual(@as(?i32, null), findListenerPid(io, 46702));
 }

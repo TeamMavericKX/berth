@@ -107,6 +107,17 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
     });
+    const kill_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/kill.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    kill_tests.root_module.link_libc = true;
+    const run_kill_tests = b.addRunArtifact(kill_tests);
+    test_step.dependOn(&run_kill_tests.step);
+
     linkSqlite(b, dash_tests.root_module);
     const run_dash_tests = b.addRunArtifact(dash_tests);
     test_step.dependOn(&run_dash_tests.step);
