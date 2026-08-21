@@ -107,6 +107,17 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
     });
+    const certs_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/certs.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    certs_tests.root_module.link_libc = true;
+    const run_certs_tests = b.addRunArtifact(certs_tests);
+    test_step.dependOn(&run_certs_tests.step);
+
     const containers_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/containers.zig"),

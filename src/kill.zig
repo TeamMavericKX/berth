@@ -301,6 +301,8 @@ test "ladder kills spawned fixture gracefully then reports not found" {
 
     var child = std.process.spawn(io, .{
         .argv = &.{ "python3", "-m", "http.server", "46711", "--bind", "127.0.0.1" },
+        .stdout = .close,
+        .stderr = .close,
     }) catch return error.SkipZigTest;
 
     // Wait for the fixture to bind before asserting on it.
@@ -344,6 +346,8 @@ test "ladder escalates to sigkill when fixture ignores term" {
                 "s=http.server.HTTPServer(('127.0.0.1',46712)," ++
                 "http.server.SimpleHTTPRequestHandler);s.serve_forever()",
         },
+        .stdout = .close,
+        .stderr = .close,
     }) catch return error.SkipZigTest;
 
     var found = false;
