@@ -27,7 +27,10 @@ const schema_sql =
 ;
 
 fn transient() c.sqlite3_destructor_type {
-    return @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
+    // SQLITE_TRANSIENT is ((void*)-1). Route through an allowzero byte
+    // pointer so aarch64's aligned-pointer check never sees the raw cast.
+    const raw: *allowzero const u8 = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
+    return @ptrCast(raw);
 }
 
 fn diag(db: ?*c.sqlite3) []const u8 {
