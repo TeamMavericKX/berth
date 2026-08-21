@@ -69,7 +69,7 @@ fn cmdServe(io: std.Io, init_gpa: std.mem.Allocator, env: *const std.process.Env
     if (loadStoredRoutes(io, init_gpa, env)) |live| {
         syncHostsFile(io, init_gpa, env, live);
     }
-    startDashboard(io, cfg.port);
+    startDashboard(io, cfg.port, env);
     proxy.serve(io, cfg) catch |err| switch (err) {
         error.AddressInUse => std.process.exit(2),
         else => std.process.exit(2),
@@ -184,11 +184,12 @@ fn editHook(gpa: std.mem.Allocator, port: u16, name: []const u8, category: []con
 
 /// Start the dashboard snapshot loop: one immediate publish so the page
 /// has data before the first scan tick, then refreshes every 5s.
-fn startDashboard(io: std.Io, cfg_port: u16) void {
+fn startDashboard(io: std.Io, cfg_port: u16, env: *const std.process.Environ.Map) void {
     dash.edit_hook = &editHook;
     dash.registered_provider = &provideRegistered;
     dash.tags_provider = &provideTagColors;
     dash.dashboard_port = cfg_port;
+    dash.auth_token = env.get("BERTH_TOKEN");
 
     const hub_ptr = dash.alloc.create(dash.Hub) catch return;
     hub_ptr.* = .{ .io = io };
