@@ -5,6 +5,9 @@ const sqlite_flags = [_][]const u8{
     "-DSQLITE_OMIT_LOAD_EXTENSION=1",
     "-DSQLITE_DQS=0",
     "-DSQLITE_DEFAULT_FOREIGN_KEYS=1",
+    // Vendored C is audited upstream; Debug-mode UB instrumentation inside
+    // sqlite3.c trips false panics on aarch64 (str_append pointer math).
+    "-fno-sanitize=undefined",
 };
 
 fn linkSqlite(builder: *std.Build, mod: *std.Build.Module) void {
