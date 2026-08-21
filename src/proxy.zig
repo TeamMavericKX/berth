@@ -194,6 +194,78 @@ test "not found page lists routes and suggestion" {
     try std.testing.expect(std.mem.indexOf(u8, page, "berth missing your-command") != null);
 }
 
+pub const max_hops = 5;
+
+fn parseHops(value: []const u8) u32 {
+    const trimmed = std.mem.trim(u8, value, " \t");
+    if (trimmed.len == 0) return 0;
+    return std.fmt.parseInt(u32, trimmed, 10) catch |err| switch (err) {
+        error.Overflow => max_hops,
+        else => 0,
+    };
+}
+
+fn findHeaderValue(request: *http.Server.Request, name: []const u8, buf: []u8) ?[]const u8 {
+    var it = request.iterateHeaders();
+    while (it.next()) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, name)) {
+            const n = @min(h.value.len, buf.len);
+            @memcpy(buf[0..n], h.value[0..n]);
+            return buf[0..n];
+        }
+    }
+    return null;
+}
+
+const loop_page_start =
+    "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>berth: loop detected</title>" ++
+    "<style>body{font:14px/1.6 -apple-system,sans-serif;color:#18181b;max-width:620px;" ++
+    "margin:12vh auto;padding:0 24px}h1{font-size:20px;margin-bottom:4px}" ++
+    "code{font-family:ui-monospace,monospace;background:#f5f5f4;border:1px solid #e7e5e4;" ++
+    "border-radius:6px;padding:1px 6px}pre{background:#f5f5f4;border:1px solid #e7e5e4;" ++
+    "border-radius:8px;padding:14px;overflow-x:auto}.hint{color:#52525b;margin-top:24px}" ++
+    ".why{color:#52525b}</style></head><body>" ++
+    "<h1>Loop detected after ";
+
+const loop_page_mid =
+    " hops</h1>" ++
+    "<p class=\"why\"><code>";
+
+const loop_page_tail =
+    "</code> keeps landing back on berth. A dev server is almost certainly " ++
+    "proxying to a <code>*.localhost</code> name without rewriting the Host header.</p>" ++
+    "<p>Point the proxy at the backend port directly:</p>" ++
+    "<pre><code>// vite.config.ts\n" ++
+    "server: {\n" ++
+    "  proxy: {\n" ++
+    "    '/api': {\n" ++
+    "      target: 'http://127.0.0.1:";
+
+fn renderLoopPage(buf: []u8, raw_host: []const u8, hops: u32, port: ?u16) []const u8 {
+    var esc_buf: [256]u8 = undefined;
+    const safe_host = escapeHtml(raw_host, &esc_buf);
+    var hops_txt: [12]u8 = undefined;
+    const hops_buf = std.fmt.bufPrint(&hops_txt, "{d}", .{hops}) catch "?";
+
+    var used: usize = 0;
+    used += (std.fmt.bufPrint(buf[used..], "{s}{s}{s}{s}{s}", .{
+        loop_page_start, hops_buf, loop_page_mid, safe_host, loop_page_tail,
+    }) catch return "render error").len;
+    if (port) |pt| {
+        used += (std.fmt.bufPrint(buf[used..], "{d}", .{pt}) catch return buf[0..used]).len;
+    } else {
+        used += (std.fmt.bufPrint(buf[used..], "&lt;backend-port&gt;", .{}) catch return buf[0..used]).len;
+    }
+    used += (std.fmt.bufPrint(
+        buf[used..],
+        "',\n      changeOrigin: true,\n    }},\n  }},\n}}</code></pre>" ++
+            "<div class=\"hint\">berth counted <code>x-berth-hops</code> on every pass; " ++
+            "five is the ceiling.</div></body></html>",
+        .{},
+    ) catch return buf[0..used]).len;
+    return buf[0..used];
+}
+
 fn handleRequest(request: *http.Server.Request) !void {
     const target = request.head.target;
 
@@ -205,22 +277,25 @@ fn handleRequest(request: *http.Server.Request) !void {
         return;
     }
 
-    // Route lookup drives the response shape: misses get the teaching
-    // page, hits acknowledge registration until backend dialing lands.
     var host_buf: [256]u8 = undefined;
-    const raw_host = blk: {
-        var hit = request.iterateHeaders();
-        while (hit.next()) |h| {
-            if (std.ascii.eqlIgnoreCase(h.name, "host")) {
-                const n = @min(h.value.len, host_buf.len);
-                @memcpy(host_buf[0..n], h.value[0..n]);
-                break :blk host_buf[0..n];
-            }
-        }
-        break :blk "";
-    };
+    const raw_host = findHeaderValue(request, "host", &host_buf) orelse "";
+
+    var hops_buf: [16]u8 = undefined;
+    const hops = parseHops(findHeaderValue(request, "x-berth-hops", &hops_buf) orelse "");
 
     const match = routes_mod.findRoute(currentRoutes(), raw_host);
+
+    if (hops >= max_hops) {
+        var loop_buf: [4096]u8 = undefined;
+        const body = renderLoopPage(&loop_buf, raw_host, hops, if (match) |m| m.port else null);
+        try request.respond(body, .{
+            .status = .loop_detected,
+            .extra_headers = &.{.{ .name = "content-type", .value = "text/html; charset=utf-8" }},
+        });
+        logDebug("route served", &.{ "path=loop", "status=508" });
+        return;
+    }
+
     if (match == null) {
         var page_buf: [4096]u8 = undefined;
         const body = renderNotFound(&page_buf, raw_host, currentRoutes());
@@ -232,6 +307,8 @@ fn handleRequest(request: *http.Server.Request) !void {
         return;
     }
 
+    var next_hops_buf: [16]u8 = undefined;
+    const next_hops = std.fmt.bufPrint(&next_hops_buf, "{d}", .{hops + 1}) catch "1";
     var ok_buf: [256]u8 = undefined;
     const ok_body = std.fmt.bufPrint(
         &ok_buf,
@@ -239,7 +316,10 @@ fn handleRequest(request: *http.Server.Request) !void {
         .{ match.?.hostname, match.?.port },
     ) catch "route registered\n";
     try request.respond(ok_body, .{
-        .extra_headers = &.{.{ .name = "x-berth", .value = "1" }},
+        .extra_headers = &.{
+            .{ .name = "x-berth", .value = "1" },
+            .{ .name = "x-berth-hops", .value = next_hops },
+        },
     });
     logDebug("route served", &.{ "path=hit", "status=200" });
 }
@@ -348,4 +428,29 @@ test "validate config refuses non-loopback" {
 test "resolve address localhost maps to ipv4 loopback" {
     const addr = try resolveAddress(.{ .host = "127.0.0.1", .port = 9999 });
     try std.testing.expectEqual(@as(u16, 9999), addr.getPort());
+}
+
+test "parse hops handles missing garbage and overflow" {
+    try std.testing.expectEqual(@as(u32, 0), parseHops(""));
+    try std.testing.expectEqual(@as(u32, 0), parseHops("  "));
+    try std.testing.expectEqual(@as(u32, 3), parseHops("3"));
+    try std.testing.expectEqual(@as(u32, 4), parseHops(" 4 "));
+    try std.testing.expectEqual(@as(u32, 0), parseHops("banana"));
+    try std.testing.expectEqual(@as(u32, max_hops), parseHops("99999999999"));
+}
+
+test "loop page names cause shows fix and port" {
+    var buf: [4096]u8 = undefined;
+    const page = renderLoopPage(&buf, "api.myapp.localhost", 5, 4001);
+    try std.testing.expect(std.mem.indexOf(u8, page, "Loop detected after 5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "api.myapp.localhost") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "changeOrigin: true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "http://127.0.0.1:4001") != null);
+}
+
+test "loop page uses placeholder when route unknown" {
+    var buf: [4096]u8 = undefined;
+    const page = renderLoopPage(&buf, "ghost.localhost", 7, null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "&lt;backend-port&gt;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "after 7") != null);
 }
