@@ -290,6 +290,7 @@ fn stripPort(raw_host: []const u8) []const u8 {
 /// app routes keep working: myapp.localhost/ still reaches the app.
 fn isDashboardTarget(target: []const u8, raw_host: []const u8) bool {
     if (!std.mem.eql(u8, target, "/") and
+        !std.mem.eql(u8, target, "/markdown") and
         !std.mem.startsWith(u8, target, "/events") and
         !std.mem.startsWith(u8, target, "/api/")) return false;
     const host = stripPort(raw_host);
