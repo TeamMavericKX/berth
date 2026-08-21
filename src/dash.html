@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>berth dashboard</title>
+<style>
+:root { --bg:#fafaf9; --fg:#18181b; --muted:#52525b; --line:#e7e5e4; --green:#047857; --red:#b91c1c; }
+* { box-sizing:border-box; }
+body { font:14px/1.6 -apple-system,sans-serif; color:var(--fg); background:var(--bg); max-width:860px; margin:12vh auto; padding:0 24px; }
+h1 { font-size:20px; margin-bottom:4px; }
+.sub { color:var(--muted); margin-bottom:20px; }
+table { width:100%; border-collapse:collapse; background:#fff; border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+th,td { text-align:left; padding:8px 12px; border-bottom:1px solid var(--line); }
+th { background:#f5f5f4; font-weight:600; font-size:12px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); }
+tr:last-child td { border-bottom:none; }
+tr.down td { color:var(--muted); }
+.dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; background:var(--red); }
+.dot.live { background:var(--green); }
+.tag { display:inline-block; padding:1px 8px; border-radius:10px; font-size:12px; background:#e7e5e4; }
+#menu { position:fixed; display:none; background:#fff; border:1px solid var(--line); border-radius:8px; box-shadow:0 8px 24px rgba(0,0,0,.12); padding:4px; z-index:10; min-width:160px; }
+#menu button { display:block; width:100%; text-align:left; padding:6px 12px; border:none; background:none; font:inherit; cursor:pointer; border-radius:6px; }
+#menu button:hover { background:#f5f5f4; }
+#menu button.danger { color:var(--red); }
+#toasts { position:fixed; bottom:16px; right:16px; display:flex; flex-direction:column; gap:8px; z-index:20; }
+.toast { background:#18181b; color:#fff; padding:8px 14px; border-radius:8px; opacity:0; transform:translateY(8px); transition:all .25s; }
+.toast.show { opacity:1; transform:none; }
+.empty { color:var(--muted); padding:32px 0; text-align:center; }
+</style>
+</head>
+<body>
+<h1>berth</h1>
+<div class="sub">live ports on loopback &middot; updates stream automatically</div>
+<table id="tbl">
+<thead><tr><th></th><th>port</th><th>name</th><th>category</th><th>source</th><th>pid</th></tr></thead>
+<tbody id="rows"></tbody>
+</table>
+<div id="empty" class="empty" style="display:none">nothing listening in 1000-9999 yet</div>
+<div id="menu"></div>
+<div id="toasts"></div>
+<script>
+const rows = document.getElementById('rows');
+const empty = document.getElementById('empty');
+const menu = document.getElementById('menu');
+let current = [];
+
+function toast(msg) {
+  const el = document.createElement('div');
+  el.className = 'toast'; el.textContent = msg;
+  document.getElementById('toasts').appendChild(el);
+  requestAnimationFrame(() => el.classList.add('show'));
+  setTimeout(() => { el.classList.remove('show'); setTimeout(() => el.remove(), 300); }, 2600);
+}
+
+function tagColor(cat) {
+  return (current.tags || {})[cat] || null;
+}
+
+function render(data) {
+  current = data;
+  const entries = data.entries || [];
+  rows.innerHTML = '';
+  empty.style.display = entries.length ? 'none' : 'block';
+  for (const e of entries) {
+    const tr = document.createElement('tr');
+    if (!e.alive) tr.className = 'down';
+    const status = `<span class="dot ${e.alive ? 'live' : ''}"></span>${e.alive ? 'live' : 'down'}`;
+    const name = e.name || '<span style="color:var(--muted)">—</span>';
+    const c = e.category || 'other';
+    const color = tagColor(c);
+    const style = color ? ` style="background:${color};color:#fff"` : '';
+    tr.innerHTML = `<td>${status}</td><td><code>${e.port}</code></td><td>${name}</td>` +
+      `<td><span class="tag"${style}>${c}</span></td><td>${e.origin}</td><td>${e.pid ?? ''}</td>`;
+    tr.dataset.port = e.port; tr.dataset.name = e.name || ''; tr.dataset.category = e.category || 'other';
+    tr.addEventListener('contextmenu', ev => { ev.preventDefault(); openMenu(ev, e); });
+    rows.appendChild(tr);
+  }
+}
+
+function openMenu(ev, entry) {
+  menu.innerHTML = '';
+  const edit = document.createElement('button');
+  edit.textContent = 'Edit name / category';
+  edit.onclick = () => { closeMenu(); editEntry(entry); };
+  const kill = document.createElement('button');
+  kill.textContent = 'Kill process';
+  kill.className = 'danger';
+  kill.onclick = async () => {
+    closeMenu();
+    if (!confirm(`Kill the process on port ${entry.port}?`)) return;
+    const res = await fetch(`/api/kill?port=${entry.port}`, { method: 'POST' });
+    toast(res.ok ? `Sent SIGTERM to port ${entry.port}` : `Could not kill port ${entry.port}`);
+  };
+  menu.append(edit, kill);
+  menu.style.display = 'block';
+  const x = Math.min(ev.clientX, innerWidth - 190);
+  const y = Math.min(ev.clientY, innerHeight - 110);
+  menu.style.left = x + 'px'; menu.style.top = y + 'px';
+}
+
+async function editEntry(entry) {
+  const name = prompt('Name', entry.name || '');
+  if (name === null) return;
+  const category = prompt('Category', entry.category || 'other') || 'other';
+  const res = await fetch(`/api/edit?port=${entry.port}&name=${encodeURIComponent(name)}&category=${encodeURIComponent(category)}`, { method: 'POST' });
+  toast(res.ok ? `Saved ${name}` : 'Save failed');
+}
+
+function closeMenu() { menu.style.display = 'none'; }
+addEventListener('click', closeMenu);
+
+const es = new EventSource('/events');
+es.addEventListener('scan', ev => { try { render(JSON.parse(ev.data)); } catch {} });
+es.addEventListener('keepalive', () => {});
+es.onerror = () => { es.close(); setTimeout(() => location.reload(), 2000); };
+
+fetch('/api/ports').then(r => r.json()).then(render).catch(() => {});
+</script>
+</body>
+</html>

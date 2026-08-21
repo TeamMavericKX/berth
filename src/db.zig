@@ -20,6 +20,11 @@ pub const App = struct {
     created_at: i64,
 };
 
+pub const TagColor = struct {
+    category: []const u8,
+    color: []const u8,
+};
+
 pub const Route = struct {
     hostname: []const u8,
     port: u16,
@@ -577,6 +582,33 @@ pub const Store = struct {
         const n = @min(stored.len, color_out.len);
         @memcpy(color_out[0..n], stored[0..n]);
         return color_out[0..n];
+    }
+
+    /// Every stored category color. Strings are duped; with an arena
+    /// caller they need no individual frees.
+    pub fn listTagColors(self: *Store, allocator: std.mem.Allocator) Error![]TagColor {
+        var stmt: ?*c.sqlite3_stmt = null;
+        const rc = c.sqlite3_prepare_v2(
+            self.handle,
+            "SELECT category,color FROM tag_colors ORDER BY category",
+            -1,
+            &stmt,
+            null,
+        );
+        try check(rc, self.handle);
+        defer _ = c.sqlite3_finalize(stmt);
+
+        var colors: std.ArrayList(TagColor) = .empty;
+        while (true) {
+            const step_rc = c.sqlite3_step(stmt);
+            if (step_rc == c.SQLITE_DONE) break;
+            try check(step_rc, self.handle);
+            try colors.append(allocator, .{
+                .category = try allocator.dupe(u8, columnText(stmt, 0)),
+                .color = try allocator.dupe(u8, columnText(stmt, 1)),
+            });
+        }
+        return colors.toOwnedSlice(allocator);
     }
 
     /// Remove a route. Returns true when a row was deleted.
