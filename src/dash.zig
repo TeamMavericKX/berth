@@ -42,20 +42,23 @@ pub const Hub = struct {
     mutex: std.Io.Mutex = .init,
     generation: u64 = 0,
     payload: []u8 = &.{},
+    markdown: []u8 = &.{},
     io: std.Io,
 
-    pub fn publish(self: *Hub, json: []u8) void {
+    pub fn publish(self: *Hub, json: []u8, md: []u8) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (self.payload.len > 0) alloc.free(self.payload);
+        if (self.markdown.len > 0) alloc.free(self.markdown);
         self.payload = json;
+        self.markdown = md;
         self.generation += 1;
     }
 
-    fn current(self: *Hub) struct { gen: u64, payload: []const u8 } {
+    fn current(self: *Hub) struct { gen: u64, payload: []const u8, markdown: []const u8 } {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        return .{ .gen = self.generation, .payload = self.payload };
+        return .{ .gen = self.generation, .payload = self.payload, .markdown = self.markdown };
     }
 };
 
@@ -95,13 +98,21 @@ pub fn refreshOnce(io: std.Io) void {
         scan_range_end,
     ) catch return;
 
-    var alloc_writer = std.Io.Writer.Allocating.init(scratch);
-    defer alloc_writer.deinit();
-    renderEntriesJson(&alloc_writer.writer, entries, tags) catch return;
+    var json_writer = std.Io.Writer.Allocating.init(scratch);
+    defer json_writer.deinit();
+    renderEntriesJson(&json_writer.writer, entries, tags) catch return;
 
-    // Only the payload escapes the tick; give it a stable home.
-    const json = alloc.dupe(u8, alloc_writer.written()) catch return;
-    hub().publish(json);
+    var md_writer = std.Io.Writer.Allocating.init(scratch);
+    defer md_writer.deinit();
+    renderMarkdown(&md_writer.writer, entries) catch return;
+
+    // Only rendered text escapes the tick; give it a stable home.
+    const json = alloc.dupe(u8, json_writer.written()) catch return;
+    const md = alloc.dupe(u8, md_writer.written()) catch {
+        alloc.free(json);
+        return;
+    };
+    hub().publish(json, md);
 }
 
 /// Refresh thread body: initial snapshot immediately, then every 5s.
@@ -110,6 +121,93 @@ pub fn refreshLoop(io: std.Io) void {
         refreshOnce(io);
         io.sleep(.fromMilliseconds(5000), .real) catch return;
     }
+}
+
+/// True when the client asked for markdown. Only an explicit
+/// text/markdown token opts in; */* and text/html get the dashboard.
+pub fn wantsMarkdown(accept: ?[]const u8) bool {
+    const a = accept orelse return false;
+    var buf: [256]u8 = undefined;
+    if (a.len > buf.len) return false;
+    const lower = std.ascii.lowerString(buf[0..a.len], a);
+    return std.mem.indexOf(u8, lower, "text/markdown") != null;
+}
+
+fn acceptHeader(request: *http.Server.Request) ?[]const u8 {
+    var it = request.iterateHeaders();
+    while (it.next()) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "accept")) return h.value;
+    }
+    return null;
+}
+
+/// Pipe-escape a cell so names cannot break the table layout.
+fn mdCell(writer: *std.Io.Writer, raw: []const u8) !void {
+    for (raw) |c| {
+        switch (c) {
+            '|' => try writer.writeAll("\\|"),
+            '\n', '\r' => try writer.writeAll(" "),
+            else => try writer.writeByte(c),
+        }
+    }
+}
+
+/// Agent-facing status page: registered apps, live ports, full API
+/// reference with copy-paste curl lines. Pure for unit tests.
+pub fn renderMarkdown(writer: *std.Io.Writer, entries: []const PortEntry) !void {
+    try writer.print("# berth\n\nPortless dev proxy on this machine. Every registered app is reachable at its `http://<name>.localhost/` URL; this dashboard runs on port {d}. Ports {d}-{d} are scanned live every few seconds.\n\n", .{ dashboard_port, scan_range_start, scan_range_end });
+
+    try writer.writeAll("## registered apps\n\n");
+    var any_reg = false;
+    for (entries) |e| {
+        if (e.origin != .registered or e.name.len == 0) continue;
+        any_reg = true;
+        break;
+    }
+    if (any_reg) {
+        try writer.writeAll("| name | url | category | port | alive |\n|---|---|---|---|---|\n");
+        for (entries) |e| {
+            if (e.origin != .registered or e.name.len == 0) continue;
+            try writer.writeAll("| ");
+            try mdCell(writer, e.name);
+            try writer.writeAll(" | http://");
+            try mdCell(writer, e.name);
+            try writer.writeAll(".localhost/ | ");
+            try mdCell(writer, e.category);
+            try writer.print(" | {d} | {s} |\n", .{ e.port, if (e.alive) "yes" else "no" });
+        }
+    } else {
+        try writer.writeAll("None yet. Start one via `berth run <name> -- <cmd>` or label a port with the edit endpoint below.\n");
+    }
+
+    try writer.writeAll("\n## live ports\n\n| port | name | origin | pid |\n|---|---|---|---|\n");
+    for (entries) |e| {
+        try writer.print("| {d} | ", .{e.port});
+        try mdCell(writer, e.name);
+        try writer.print(" | {s} | ", .{@tagName(e.origin)});
+        if (e.pid) |p| try writer.print("{d}", .{p}) else try writer.writeAll("-");
+        try writer.writeAll(" |\n");
+    }
+
+    try writer.print("\n## api reference\n\nAll endpoints answer on the bare `localhost` host (port {d}).\n\n", .{dashboard_port});
+
+    const blocks = [_]struct { head: []const u8, pre: []const u8, post: []const u8 }{
+        .{ .head = "### GET /api/ports - every port berth sees, as JSON", .pre = "curl http://localhost:", .post = "/api/ports" },
+        .{ .head = "### POST /api/edit?port=PORT&name=NAME&category=CATEGORY - label an app", .pre = "curl -X POST 'http://localhost:", .post = "/api/edit?port=4300&name=myapp&category=web'" },
+        .{ .head = "### POST /api/kill?port=PORT - stop a listener (TERM, then KILL after 2s)", .pre = "curl -X POST 'http://localhost:", .post = "/api/kill?port=4300'" },
+        .{ .head = "### GET /events - server-sent events: snapshot on change, keepalive every 15s", .pre = "curl -N http://localhost:", .post = "/events" },
+        .{ .head = "### GET /markdown - this page", .pre = "curl http://localhost:", .post = "/markdown" },
+    };
+    for (blocks) |b| {
+        try writer.writeAll(b.head);
+        try writer.writeAll("\n\n    ");
+        try writer.writeAll(b.pre);
+        try writer.print("{d}", .{dashboard_port});
+        try writer.writeAll(b.post);
+        try writer.writeAll("\n\n");
+    }
+
+    try writer.writeAll("### proxying\n\nAny `<name>.localhost` URL proxies to that app's port:\n\n    curl http://myapp.localhost/some/path\n");
 }
 
 /// Render entries as the SSE data payload. Pure for unit tests.
@@ -176,8 +274,35 @@ pub fn handleDashboardRequest(request: *http.Server.Request, io: std.Io) !void {
         if (request.head.method != .GET) {
             return request.respond("method not allowed\n", .{ .status = .method_not_allowed, .keep_alive = false });
         }
+        const snap = hub().current();
+        if (wantsMarkdown(acceptHeader(request))) {
+            try request.respond(snap.markdown, .{
+                .extra_headers = &.{
+                    .{ .name = "content-type", .value = "text/markdown; charset=utf-8" },
+                    .{ .name = "vary", .value = "accept" },
+                },
+            });
+            return;
+        }
         try request.respond(html, .{
-            .extra_headers = &.{.{ .name = "content-type", .value = "text/html; charset=utf-8" }},
+            .extra_headers = &.{
+                .{ .name = "content-type", .value = "text/html; charset=utf-8" },
+                .{ .name = "vary", .value = "accept" },
+            },
+        });
+        return;
+    }
+
+    if (std.mem.eql(u8, target, "/markdown")) {
+        if (request.head.method != .GET) {
+            return request.respond("method not allowed\n", .{ .status = .method_not_allowed, .keep_alive = false });
+        }
+        const snap = hub().current();
+        try request.respond(snap.markdown, .{
+            .extra_headers = &.{
+                .{ .name = "content-type", .value = "text/markdown; charset=utf-8" },
+                .{ .name = "vary", .value = "accept" },
+            },
         });
         return;
     }
@@ -366,4 +491,38 @@ test "query param extracts port and name" {
     try std.testing.expectEqualStrings("my%20app", queryParam(t2, "name", &buf).?);
     try std.testing.expectEqualStrings("web", queryParam(t2, "category", &buf).?);
     try std.testing.expectEqual(@as(?[]const u8, null), queryParam("/api/kill", "port", &buf));
+}
+
+test "wants markdown only on explicit token" {
+    try std.testing.expect(wantsMarkdown("text/markdown"));
+    try std.testing.expect(wantsMarkdown("Text/Markdown"));
+    try std.testing.expect(wantsMarkdown("application/json, text/markdown;q=0.9"));
+    try std.testing.expect(!wantsMarkdown(null));
+    try std.testing.expect(!wantsMarkdown(""));
+    try std.testing.expect(!wantsMarkdown("*/*"));
+    try std.testing.expect(!wantsMarkdown("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"));
+}
+
+test "markdown status page renders tables api reference and escapes pipes" {
+    var buf: [4096]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    const entries = [_]PortEntry{
+        .{ .port = 4300, .name = "in|voice", .category = "api", .origin = .registered, .alive = true, .pid = 42 },
+        .{ .port = 4400, .origin = .anonymous, .alive = true },
+    };
+    try renderMarkdown(&writer, entries[0..]);
+    const out = writer.buffered();
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "# berth\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "| in\\|voice | http://in\\|voice.localhost/ | api | 4300 | yes |") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "| 4400 |  | anonymous | - |") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "## api reference") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "curl http://localhost:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "/api/edit?port=4300&name=myapp&category=web") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "http://myapp.localhost/some/path") != null);
+
+    // Empty catalog renders the hint instead of a bare table header.
+    var w2: std.Io.Writer = .fixed(&buf);
+    try renderMarkdown(&w2, &.{});
+    try std.testing.expect(std.mem.indexOf(u8, w2.buffered(), "None yet.") != null);
 }
