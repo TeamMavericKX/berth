@@ -3,6 +3,7 @@ const proxy = @import("proxy.zig");
 const db = @import("db.zig");
 const routes = @import("routes.zig");
 const hostsync = @import("hostsync.zig");
+const run_mod = @import("run.zig");
 
 pub const version = proxy.version;
 
@@ -26,6 +27,9 @@ pub fn main(init: std.process.Init) !void {
     }
     if (std.mem.eql(u8, cmd, "serve")) {
         return cmdServe(init.io, init.gpa, init.environ_map, &it);
+    }
+    if (std.mem.eql(u8, cmd, "run")) {
+        return cmdRun(init.io, init.gpa, init.environ_map, &it);
     }
 
     usageFail("unknown command", cmd);
@@ -70,25 +74,52 @@ fn cmdServe(io: std.Io, init_gpa: std.mem.Allocator, env: *const std.process.Env
     };
 }
 
-/// Seed the proxy's in-memory route table from ~/.berth/berth.db. A missing
-/// or unreadable store is not fatal: serve runs with an empty table and the
-/// teaching 404s explain how to register. Hostnames stay allocated for the
-/// life of the process which is fine for a daemon.
-fn loadStoredRoutes(io: std.Io, gpa: std.mem.Allocator, env: *const std.process.Environ.Map) ?[]routes.Route {
+/// The route store stays open for the life of the process so request-time
+/// lookups can consult it (see proxy.dynamic_lookup).
+var run_store: ?db.Store = null;
+
+fn dynamicLookup(out: []u8, hostname: []const u8) ?routes.Route {
+    const s = &(run_store orelse return null);
+    const row = (s.lookupRoute(out, hostname) catch return null) orelse return null;
+    return .{ .hostname = row.hostname, .port = row.port };
+}
+
+fn openStore(io: std.Io, gpa: std.mem.Allocator, env: *const std.process.Environ.Map) ?db.Store {
     const home = env.get("HOME") orelse env.get("USERPROFILE") orelse return null;
     db.ensureDataDir(io, gpa, home) catch return null;
     const path = db.defaultDbPath(gpa, home) catch return null;
     defer gpa.free(path);
-    var store = db.Store.open(io, path) catch |err| {
+    return db.Store.open(io, path) catch |err| {
         std.debug.print("berth: route store unavailable ({s}); starting empty\n", .{@errorName(err)});
         return null;
     };
-    defer store.close();
-    const listed = store.listRoutes(gpa) catch return null;
+}
+
+fn collectLiveRoutes(gpa: std.mem.Allocator) ?[]routes.Route {
+    const s = &(run_store orelse return null);
+    const listed = s.listRoutes(gpa) catch return null;
     const live = gpa.alloc(routes.Route, listed.len) catch return null;
     for (listed, 0..) |r, i| {
         live[i] = .{ .hostname = r.hostname, .port = r.port };
     }
+    return live;
+}
+
+fn syncHostsFromStore(io: std.Io, gpa: std.mem.Allocator, env: *const std.process.Environ.Map) void {
+    const live = collectLiveRoutes(gpa) orelse return;
+    defer gpa.free(live);
+    syncHostsFile(io, gpa, env, live);
+}
+
+/// Seed the proxy's in-memory route table from ~/.berth/berth.db and keep
+/// the store open for request-time lookups. A missing or unreadable store
+/// is not fatal: serve runs with an empty table and the teaching 404s
+/// explain how to register. Hostnames stay allocated for the life of the
+/// process which is fine for a daemon.
+fn loadStoredRoutes(io: std.Io, gpa: std.mem.Allocator, env: *const std.process.Environ.Map) ?[]routes.Route {
+    proxy.dynamic_lookup = &dynamicLookup;
+    run_store = openStore(io, gpa, env) orelse return null;
+    const live = collectLiveRoutes(gpa) orelse return null;
     proxy.setLiveRoutes(live);
     return live;
 }
@@ -123,6 +154,111 @@ fn syncHostsFile(io: std.Io, gpa: std.mem.Allocator, env: *const std.process.Env
     }
 }
 
+/// `berth run [--name NAME] -- CMD...`: allocate a dev port, export PORT,
+/// spawn CMD, register name.localhost while it lives, deregister on exit.
+fn cmdRun(io: std.Io, gpa: std.mem.Allocator, env: *const std.process.Environ.Map, it: *std.process.Args.Iterator) !void {
+    var explicit_name: ?[]const u8 = null;
+    var argv_list: std.ArrayList([]const u8) = .empty;
+
+    while (it.next()) |arg| {
+        if (argv_list.items.len > 0) {
+            try argv_list.append(gpa, arg);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--")) continue;
+        if (std.mem.eql(u8, arg, "--name")) {
+            explicit_name = it.next() orelse usageFail("--name requires a value", "");
+            continue;
+        }
+        if (arg.len > 0 and arg[0] == '-') usageFail("unknown flag for run", arg);
+        try argv_list.append(gpa, arg);
+    }
+    if (argv_list.items.len == 0) usageFail("run needs a command", "  example: berth run -- npm run dev");
+
+    var cwd_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const cwd_n = std.Io.Dir.cwd().realPathFile(io, ".", &cwd_buf) catch 0;
+    if (cwd_n == 0) usageFail("could not resolve working directory", "");
+    const cwd = cwd_buf[0..cwd_n];
+
+    const name = run_mod.inferName(io, gpa, cwd, explicit_name) orelse
+        usageFail("could not infer a name; pass --name", "");
+    var host_buf: [256]u8 = undefined;
+    const hostname = run_mod.deriveHostname(&host_buf, name);
+
+    run_store = openStore(io, gpa, env) orelse std.process.exit(2);
+    const s = &run_store.?;
+
+    // Fail fast when a live process already owns the name.
+    var probe_buf: [256]u8 = undefined;
+    if (s.lookupRoute(&probe_buf, hostname) catch null) |existing| {
+        std.debug.print(
+            "berth: {s} is already registered by pid {d}\n",
+            .{ hostname, existing.pid },
+        );
+        std.process.exit(3);
+    }
+
+    var seed: [8]u8 = undefined;
+    io.random(&seed);
+    const seed_int = std.mem.readInt(u64, &seed, .little);
+    var candidates = run_mod.PortCandidates.init(seed_int);
+    const port = run_mod.findFreePort(io, &candidates) orelse {
+        std.debug.print(
+            "berth: no free port in {d}-{d} after {d} attempts\n",
+            .{ run_mod.port_range_start, run_mod.port_range_end, run_mod.max_port_attempts },
+        );
+        std.process.exit(3);
+    };
+
+    var child_env = env.clone(gpa) catch std.process.exit(2);
+    var port_buf: [8]u8 = undefined;
+    const port_str = std.fmt.bufPrint(&port_buf, "{d}", .{port}) catch unreachable;
+    child_env.put("PORT", port_str) catch std.process.exit(2);
+
+    var child = std.process.spawn(io, .{
+        .argv = argv_list.items,
+        .environ_map = &child_env,
+    }) catch |err| {
+        std.debug.print("berth: failed to spawn '{s}' ({s})\n", .{ argv_list.items[0], @errorName(err) });
+        std.process.exit(4);
+    };
+
+    // Windows handles are opaque; store 0 so the row is reclaimable.
+    const child_pid: i32 = if (@import("builtin").os.tag == .windows) 0 else @intCast(child.id.?);
+    _ = s.insertRoute(hostname, port, child_pid) catch |err| {
+        std.debug.print("berth: could not register {s} ({s})\n", .{ hostname, @errorName(err) });
+        _ = s.deleteRoute(hostname) catch {};
+        std.process.exit(3);
+    };
+    syncHostsFromStore(io, gpa, env);
+
+    std.debug.print("berth: {s} -> 127.0.0.1:{d} (pid {d})\n", .{ hostname, port, child_pid });
+
+    const term = child.wait(io) catch |err| {
+        std.debug.print("berth: wait failed ({s}); releasing route\n", .{@errorName(err)});
+        _ = s.deleteRoute(hostname) catch {};
+        syncHostsFromStore(io, gpa, env);
+        std.process.exit(4);
+    };
+
+    _ = s.deleteRoute(hostname) catch {};
+    syncHostsFromStore(io, gpa, env);
+    switch (term) {
+        .exited => |code| {
+            std.debug.print("berth: released {s}\n", .{hostname});
+            std.process.exit(code);
+        },
+        .signal => |sig| {
+            std.debug.print("berth: child killed by signal; released {s}\n", .{hostname});
+            std.process.exit(128 + @as(u8, @intCast(@intFromEnum(sig))));
+        },
+        else => {
+            std.debug.print("berth: released {s}\n", .{hostname});
+            std.process.exit(1);
+        },
+    }
+}
+
 fn usageFail(msg: []const u8, detail: []const u8) noreturn {
     if (detail.len > 0) {
         std.debug.print("{s}: '{s}'\n  run: berth --help\n", .{ msg, detail });
@@ -142,6 +278,7 @@ fn printHelp() !void {
         \\
         \\usage:
         \\  berth serve [--host 127.0.0.1] [--port 8080]   run the proxy (loopback only)
+        \\  berth run [--name NAME] -- CMD...              spawn CMD with PORT set and a name.localhost route
         \\  berth version                                  print version
         \\  berth help                                     this text
         \\

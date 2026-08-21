@@ -80,6 +80,11 @@ fn serveConnection(stream: net.Stream, io: std.Io) !void {
 var live_routes_buf: [64]routes_mod.Route = undefined;
 var live_routes_len: usize = 0;
 
+/// Optional fallback consulted on route misses so registrations made by
+/// `berth run` are visible to an already-running serve without a restart.
+/// Implementations copy the stored hostname into out and return the row.
+pub var dynamic_lookup: ?*const fn (out: []u8, hostname: []const u8) ?routes_mod.Route = null;
+
 pub fn setLiveRoutes(routes: []const routes_mod.Route) void {
     const n = @min(routes.len, live_routes_buf.len);
     @memcpy(live_routes_buf[0..n], routes);
@@ -296,7 +301,15 @@ fn handleRequest(request: *http.Server.Request) !void {
         return;
     }
 
-    if (match == null) {
+    const resolved = match orelse blk: {
+        if (dynamic_lookup) |lookup| {
+            var dyn_buf: [256]u8 = undefined;
+            if (lookup(&dyn_buf, raw_host)) |m| break :blk m;
+        }
+        break :blk null;
+    };
+
+    if (resolved == null) {
         var page_buf: [4096]u8 = undefined;
         const body = renderNotFound(&page_buf, raw_host, currentRoutes());
         try request.respond(body, .{
@@ -313,7 +326,7 @@ fn handleRequest(request: *http.Server.Request) !void {
     const ok_body = std.fmt.bufPrint(
         &ok_buf,
         "route registered: {s} -> 127.0.0.1:{d}\nbackend dialing arrives with the sqlite store.\n",
-        .{ match.?.hostname, match.?.port },
+        .{ resolved.?.hostname, resolved.?.port },
     ) catch "route registered\n";
     try request.respond(ok_body, .{
         .extra_headers = &.{
