@@ -1,6 +1,7 @@
 const std = @import("std");
 const http = std.http;
 const net = std.Io.net;
+const routes_mod = @import("routes.zig");
 
 pub const version = "0.1.0";
 
@@ -74,9 +75,127 @@ fn serveConnection(stream: net.Stream, io: std.Io) !void {
     }
 }
 
+/// Live routes the 404 page advertises. Replaced by the SQLite store in
+/// issue #10; a fixed buffer keeps this PR self-contained.
+var live_routes_buf: [64]routes_mod.Route = undefined;
+var live_routes_len: usize = 0;
+
+pub fn setLiveRoutes(routes: []const routes_mod.Route) void {
+    const n = @min(routes.len, live_routes_buf.len);
+    @memcpy(live_routes_buf[0..n], routes);
+    live_routes_len = n;
+}
+
+fn currentRoutes() []const routes_mod.Route {
+    return live_routes_buf[0..live_routes_len];
+}
+
+/// Strip a trailing ".tld" (e.g. ".localhost") for the suggested command.
+fn stripTld(host: []const u8, comptime tld: []const u8) []const u8 {
+    if (std.mem.endsWith(u8, host, tld)) {
+        const stripped = host[0 .. host.len - tld.len];
+        if (stripped.len > 0) return stripped;
+    }
+    return host;
+}
+
+test "strip tld for suggestion" {
+    try std.testing.expectEqualStrings("myapp", stripTld("myapp.localhost", ".localhost"));
+    try std.testing.expectEqualStrings("api.myapp", stripTld("api.myapp.localhost", ".localhost"));
+    try std.testing.expectEqualStrings("plain.example.com", stripTld("plain.example.com", ".localhost"));
+}
+
+test "escape html entities" {
+    var out: [64]u8 = undefined;
+    const got = escapeHtml("<b>&\"x\"", &out);
+    try std.testing.expectEqualStrings("&lt;b&gt;&amp;&quot;x&quot;", got);
+}
+
+fn escapeHtml(src: []const u8, buf: []u8) []const u8 {
+    var used: usize = 0;
+    for (src) |c| {
+        const rep: []const u8 = switch (c) {
+            '<' => "&lt;",
+            '>' => "&gt;",
+            '&' => "&amp;",
+            '"' => "&quot;",
+            '\'' => "&#39;",
+            else => &[_]u8{c},
+        };
+        if (used + rep.len > buf.len) break;
+        @memcpy(buf[used .. used + rep.len], rep);
+        used += rep.len;
+    }
+    return buf[0..used];
+}
+
+const not_found_page_start =
+    "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>berth</title>" ++
+    "<style>body{font:14px/1.6 -apple-system,sans-serif;color:#18181b;" ++
+    "max-width:620px;margin:12vh auto;padding:0 24px}" ++
+    "h1{font-size:20px;margin-bottom:4px}code{font-family:ui-monospace,monospace;" ++
+    "background:#f5f5f4;border:1px solid #e7e5e4;border-radius:6px;padding:1px 6px}" ++
+    "ul{padding-left:18px}li{margin:6px 0}a{color:#047857}" ++
+    ".hint{color:#52525b;margin-top:24px}</style></head><body>" ++
+    "<h1>No app registered for <code>";
+
+const not_found_page_mid = "</code></h1>";
+
+fn appendRouteList(buf: []u8, routes: []const routes_mod.Route) usize {
+    var n: usize = 0;
+    if (routes.len == 0) {
+        n += (std.fmt.bufPrint(buf[n..], "<p>No apps are running.</p>", .{}) catch return n).len;
+        return n;
+    }
+    n += (std.fmt.bufPrint(buf[n..], "<p>Active apps:</p><ul>", .{}) catch return n).len;
+    for (routes) |r| {
+        n += (std.fmt.bufPrint(
+            buf[n..],
+            "<li><a href=\"http://{s}:{d}/\">{s}</a> &rarr; 127.0.0.1:{d}</li>",
+            .{ r.hostname, r.port, r.hostname, r.port },
+        ) catch break).len;
+    }
+    n += (std.fmt.bufPrint(buf[n..], "</ul>", .{}) catch return n).len;
+    return n;
+}
+
+/// Render the teaching 404: what missed, which apps are live, and the exact
+/// command that would register the requested name. Ported from portless
+/// proxy.ts:203-227.
+fn renderNotFound(buf: []u8, raw_host: []const u8, routes: []const routes_mod.Route) []const u8 {
+    var esc_buf: [256]u8 = undefined;
+    const safe_host = escapeHtml(raw_host, &esc_buf);
+
+    var used: usize = 0;
+    used += (std.fmt.bufPrint(buf[used..], "{s}{s}{s}", .{
+        not_found_page_start, safe_host, not_found_page_mid,
+    }) catch return "render error").len;
+    used += appendRouteList(buf[used..], routes);
+
+    const suggestion = stripTld(raw_host, ".localhost");
+    used += (std.fmt.bufPrint(
+        buf[used..],
+        "<div class=\"hint\">start it with:<br><code>suggest: berth {s} your-command</code></div></body></html>",
+        .{suggestion},
+    ) catch return buf[0..used]).len;
+    return buf[0..used];
+}
+
+test "not found page lists routes and suggestion" {
+    const routes = [_]routes_mod.Route{
+        .{ .hostname = "one.localhost", .port = 4001 },
+        .{ .hostname = "two.localhost", .port = 4002 },
+    };
+    var buf: [2048]u8 = undefined;
+    const page = renderNotFound(&buf, "missing.localhost", &routes);
+    try std.testing.expect(std.mem.indexOf(u8, page, "missing.localhost") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "one.localhost") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "two.localhost") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page, "berth missing your-command") != null);
+}
+
 fn handleRequest(request: *http.Server.Request) !void {
     const target = request.head.target;
-    const method = @tagName(request.head.method);
 
     if (std.mem.eql(u8, target, "/healthz")) {
         try request.respond("ok\n", .{
@@ -86,22 +205,43 @@ fn handleRequest(request: *http.Server.Request) !void {
         return;
     }
 
-    const body = try std.fmt.allocPrint(
-        std.heap.page_allocator,
-        "no route for {s} {s}\nberth is pre-alpha; routing arrives with the next milestones.\n",
-        .{ method, target },
-    );
-    defer std.heap.page_allocator.free(body);
+    // Route lookup drives the response shape: misses get the teaching
+    // page, hits acknowledge registration until backend dialing lands.
+    var host_buf: [256]u8 = undefined;
+    const raw_host = blk: {
+        var hit = request.iterateHeaders();
+        while (hit.next()) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, "host")) {
+                const n = @min(h.value.len, host_buf.len);
+                @memcpy(host_buf[0..n], h.value[0..n]);
+                break :blk host_buf[0..n];
+            }
+        }
+        break :blk "";
+    };
 
-    // Consume any request body so keep-alive connections stay usable.
-    var head_buffer: [16 * 1024]u8 = undefined;
-    _ = request.readerExpectNone(&head_buffer);
+    const match = routes_mod.findRoute(currentRoutes(), raw_host);
+    if (match == null) {
+        var page_buf: [4096]u8 = undefined;
+        const body = renderNotFound(&page_buf, raw_host, currentRoutes());
+        try request.respond(body, .{
+            .status = .not_found,
+            .extra_headers = &.{.{ .name = "content-type", .value = "text/html; charset=utf-8" }},
+        });
+        logDebug("route served", &.{ "path=miss", "status=404" });
+        return;
+    }
 
-    try request.respond(body, .{
-        .status = .not_found,
-        .extra_headers = &.{.{ .name = "content-type", .value = "text/plain; charset=utf-8" }},
+    var ok_buf: [256]u8 = undefined;
+    const ok_body = std.fmt.bufPrint(
+        &ok_buf,
+        "route registered: {s} -> 127.0.0.1:{d}\nbackend dialing arrives with the sqlite store.\n",
+        .{ match.?.hostname, match.?.port },
+    ) catch "route registered\n";
+    try request.respond(ok_body, .{
+        .extra_headers = &.{.{ .name = "x-berth", .value = "1" }},
     });
-    logDebug("route served", &.{ "path=unknown", "status=404" });
+    logDebug("route served", &.{ "path=hit", "status=200" });
 }
 
 fn logLine(level: []const u8, msg: []const u8, kv: []const []const u8) void {
