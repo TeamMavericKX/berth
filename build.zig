@@ -30,4 +30,14 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
+
+    const routes_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/routes.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_routes_tests = b.addRunArtifact(routes_tests);
+    test_step.dependOn(&run_routes_tests.step);
 }
