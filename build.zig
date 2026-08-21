@@ -67,4 +67,14 @@ pub fn build(b: *std.Build) void {
     linkSqlite(b, db_tests.root_module);
     const run_db_tests = b.addRunArtifact(db_tests);
     test_step.dependOn(&run_db_tests.step);
+
+    const hosts_mod = b.createModule(.{
+        .root_source_file = b.path("src/hostsync.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    hosts_mod.link_libc = true;
+    const hosts_tests = b.addTest(.{ .root_module = hosts_mod });
+    const run_hosts_tests = b.addRunArtifact(hosts_tests);
+    test_step.dependOn(&run_hosts_tests.step);
 }

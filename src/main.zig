@@ -2,6 +2,7 @@ const std = @import("std");
 const proxy = @import("proxy.zig");
 const db = @import("db.zig");
 const routes = @import("routes.zig");
+const hostsync = @import("hostsync.zig");
 
 pub const version = proxy.version;
 
@@ -60,7 +61,9 @@ fn cmdServe(io: std.Io, init_gpa: std.mem.Allocator, env: *const std.process.Env
         std.process.exit(1);
     }
 
-    loadStoredRoutes(io, init_gpa, env);
+    if (loadStoredRoutes(io, init_gpa, env)) |live| {
+        syncHostsFile(io, init_gpa, env, live);
+    }
     proxy.serve(io, cfg) catch |err| switch (err) {
         error.AddressInUse => std.process.exit(2),
         else => std.process.exit(2),
@@ -71,22 +74,53 @@ fn cmdServe(io: std.Io, init_gpa: std.mem.Allocator, env: *const std.process.Env
 /// or unreadable store is not fatal: serve runs with an empty table and the
 /// teaching 404s explain how to register. Hostnames stay allocated for the
 /// life of the process which is fine for a daemon.
-fn loadStoredRoutes(io: std.Io, gpa: std.mem.Allocator, env: *const std.process.Environ.Map) void {
-    const home = env.get("HOME") orelse env.get("USERPROFILE") orelse return;
-    db.ensureDataDir(io, gpa, home) catch return;
-    const path = db.defaultDbPath(gpa, home) catch return;
+fn loadStoredRoutes(io: std.Io, gpa: std.mem.Allocator, env: *const std.process.Environ.Map) ?[]routes.Route {
+    const home = env.get("HOME") orelse env.get("USERPROFILE") orelse return null;
+    db.ensureDataDir(io, gpa, home) catch return null;
+    const path = db.defaultDbPath(gpa, home) catch return null;
     defer gpa.free(path);
     var store = db.Store.open(io, path) catch |err| {
         std.debug.print("berth: route store unavailable ({s}); starting empty\n", .{@errorName(err)});
-        return;
+        return null;
     };
     defer store.close();
-    const listed = store.listRoutes(gpa) catch return;
-    const live = gpa.alloc(routes.Route, listed.len) catch return;
+    const listed = store.listRoutes(gpa) catch return null;
+    const live = gpa.alloc(routes.Route, listed.len) catch return null;
     for (listed, 0..) |r, i| {
         live[i] = .{ .hostname = r.hostname, .port = r.port };
     }
     proxy.setLiveRoutes(live);
+    return live;
+}
+
+/// Mirror stored routes into /etc/hosts inside the managed marker block.
+/// BERTH_SYNC_HOSTS=0 opts out; an unwritable hosts file degrades to a
+/// warning that shows the exact block to add by hand.
+fn syncHostsFile(io: std.Io, gpa: std.mem.Allocator, env: *const std.process.Environ.Map, live: []const routes.Route) void {
+    const enabled = if (env.get("BERTH_SYNC_HOSTS")) |v|
+        !std.mem.eql(u8, v, "0")
+    else
+        true;
+    const outcome = hostsync.sync(io, gpa, "/etc/hosts", live, enabled) catch |err| {
+        var names = gpa.alloc([]const u8, live.len) catch return;
+        defer gpa.free(names);
+        for (live, 0..) |r, i| names[i] = r.hostname;
+        const block = hostsync.buildBlock(gpa, names) catch return;
+        defer gpa.free(block);
+        std.debug.print(
+            "berth: cannot update /etc/hosts ({s})\n" ++
+                "  resolution needs these entries; add them manually or rerun once with sudo:\n{s}",
+            .{ @errorName(err), block },
+        );
+        return;
+    };
+    switch (outcome) {
+        .synced => std.debug.print("berth: synced {d} host entr{s} into /etc/hosts\n", .{
+            live.len,
+            if (live.len == 1) "y" else "ies",
+        }),
+        .unchanged, .opted_out, .unsupported_platform => {},
+    }
 }
 
 fn usageFail(msg: []const u8, detail: []const u8) noreturn {
