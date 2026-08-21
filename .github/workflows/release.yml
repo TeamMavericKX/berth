@@ -1,0 +1,54 @@
+name: release
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        triple: [x86_64-linux, aarch64-linux, x86_64-macos, aarch64-macos, x86_64-windows]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Zig 0.16.0
+        run: |
+          curl -fsSL --retry 5 --retry-delay 5 \
+            "https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz" \
+            -o /tmp/zig.tar.xz
+          mkdir -p "$HOME/.zig"
+          tar -xJf /tmp/zig.tar.xz -C "$HOME/.zig" --strip-components=1
+          echo "$HOME/.zig" >> "$GITHUB_PATH"
+      - name: Build ReleaseSafe
+        run: zig build -Dtarget=${{ matrix.triple }} -Doptimize=ReleaseSafe
+      - name: Package
+        run: |
+          DIR="berth-${GITHUB_REF_NAME}-${{ matrix.triple }}"
+          mkdir "$DIR"
+          cp zig-out/bin/* "$DIR"/ 2>/dev/null || true
+          cp README.md LICENSE CHANGELOG.md "$DIR"/
+          tar -czf "$DIR.tar.gz" "$DIR"
+          sha256sum "$DIR.tar.gz" > "$DIR.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: berth-${{ matrix.triple }}
+          path: |
+            berth-*.tar.gz
+            berth-*.tar.gz.sha256
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: dist/*
