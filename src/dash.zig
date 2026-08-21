@@ -407,7 +407,60 @@ pub fn queryParam(target: []const u8, key: []const u8, buf: []u8) ?[]const u8 {
 /// POST /api/ports returns the current snapshot; POST /api/kill sends
 /// SIGTERM to the listener on port. Both re-publish so streams see the
 /// change within one second.
+/// Shared secret for mutations when set (BERTH_TOKEN). Null keeps
+/// origin-only gating.
+pub var auth_token: ?[]const u8 = null;
+
+/// True when an Origin header is absent or points at a loopback host
+/// served locally. Foreign origins are the browser CSRF vector this
+/// gate exists to close.
+pub fn originAllowed(origin: ?[]const u8) bool {
+    const o = origin orelse return true;
+    const scheme_sep = std.mem.indexOf(u8, o, "://") orelse return false;
+    var host = o[scheme_sep + 3 ..];
+    // Origin carries no path; tolerate trailing junk defensively anyway.
+    if (std.mem.indexOfScalar(u8, host, '/')) |slash| host = host[0..slash];
+
+    if (host.len > 0 and host[0] == '[') {
+        const close = std.mem.indexOfScalar(u8, host, ']') orelse return false;
+        return std.mem.eql(u8, host[0 .. close + 1], "[::1]");
+    }
+    if (std.mem.indexOfScalar(u8, host, ':')) |colon| host = host[0..colon];
+    return std.mem.eql(u8, host, "localhost") or std.mem.eql(u8, host, "127.0.0.1") or std.mem.eql(u8, host, "::1");
+}
+
+fn headerValue(request: *http.Server.Request, name: []const u8) ?[]const u8 {
+    var it = request.iterateHeaders();
+    while (it.next()) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
+    }
+    return null;
+}
+
+/// Constant-time bearer token comparison.
+fn bearerMatches(request: *http.Server.Request, expected: []const u8) bool {
+    const value = headerValue(request, "authorization") orelse return false;
+    const prefix = "bearer ";
+    if (value.len <= prefix.len) return false;
+    if (!std.ascii.eqlIgnoreCase(value[0..prefix.len], prefix)) return false;
+    const got = std.mem.trim(u8, value[prefix.len..], " ");
+    if (got.len != expected.len) return false;
+    var diff: u8 = 0;
+    for (got, expected) |a, b| diff |= a ^ b;
+    return diff == 0;
+}
+
+/// Mutations answer only to same-origin browsers or, when a token is
+/// configured, to callers bearing it. Reads stay open.
+pub fn mutationAuthorized(request: *http.Server.Request) bool {
+    if (auth_token) |t| return bearerMatches(request, t);
+    return originAllowed(headerValue(request, "origin"));
+}
+
 pub fn handleApiKill(io: std.Io, request: *http.Server.Request) !void {
+    if (!mutationAuthorized(request)) {
+        return request.respond("forbidden\n", .{ .status = .forbidden, .keep_alive = false });
+    }
     var qbuf: [32]u8 = undefined;
     const port_str = queryParam(request.head.target, "port", &qbuf) orelse {
         return request.respond("missing port\n", .{ .status = .bad_request, .keep_alive = false });
@@ -429,6 +482,9 @@ pub fn handleApiKill(io: std.Io, request: *http.Server.Request) !void {
 }
 
 pub fn handleApiEdit(io: std.Io, request: *http.Server.Request) !void {
+    if (!mutationAuthorized(request)) {
+        return request.respond("forbidden\n", .{ .status = .forbidden, .keep_alive = false });
+    }
     var qbuf: [128]u8 = undefined;
     var nbuf: [128]u8 = undefined;
     var cbuf: [64]u8 = undefined;
@@ -528,4 +584,40 @@ test "markdown status page renders tables api reference and escapes pipes" {
     var w2: std.Io.Writer = .fixed(&buf);
     try renderMarkdown(&w2, &.{});
     try std.testing.expect(std.mem.indexOf(u8, w2.buffered(), "None yet.") != null);
+}
+
+test "origin allowlist admits loopback and rejects everything else" {
+    try std.testing.expect(originAllowed(null));
+    try std.testing.expect(originAllowed("http://localhost"));
+    try std.testing.expect(originAllowed("http://localhost:8080"));
+    try std.testing.expect(originAllowed("https://127.0.0.1"));
+    try std.testing.expect(originAllowed("http://127.0.0.1:3000"));
+    try std.testing.expect(originAllowed("https://[::1]:8817"));
+
+    try std.testing.expect(!originAllowed("http://evil.com"));
+    try std.testing.expect(!originAllowed("https://evil.com:8080"));
+    // Suffix tricks must never pass as loopback.
+    try std.testing.expect(!originAllowed("http://localhost.evil.com"));
+    try std.testing.expect(!originAllowed("http://127.0.0.1.evil.com"));
+    try std.testing.expect(!originAllowed("not-a-url"));
+    try std.testing.expect(!originAllowed(""));
+}
+
+test "bearer comparison matches exactly" {
+    const expected = "sekret";
+    const pairs = [_]struct { got: []const u8, want: bool }{
+        .{ .got = "sekret", .want = true },
+        .{ .got = "sekrt", .want = false },
+        .{ .got = "sekrets", .want = false },
+        .{ .got = "", .want = false },
+    };
+    for (pairs) |p| {
+        if (p.got.len != expected.len) {
+            try std.testing.expect(!p.want);
+            continue;
+        }
+        var diff: u8 = 0;
+        for (p.got, expected) |a, b| diff |= a ^ b;
+        try std.testing.expectEqual(p.want, diff == 0);
+    }
 }

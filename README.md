@@ -46,6 +46,18 @@ zig build test
 4. Every error page teaches the fix. A 508 should tell you exactly which config line to change.
 5. Agents are first-class users. Markdown in, JSON out, deterministic URLs.
 
+## Security
+
+The dashboard and its API bind to loopback only. Mutating endpoints
+(`/api/edit`, `/api/kill`) reject any request whose `Origin` header is
+present and not a loopback host — a random website cannot make your
+browser murder dev servers via `fetch`. Read endpoints stay open by
+design.
+
+Set `BERTH_TOKEN=<secret>` when running `berth serve` to additionally
+require `Authorization: Bearer <secret>` on every mutation; agents can
+pass it with `curl -H "Authorization: Bearer $BERTH_TOKEN"`.
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
