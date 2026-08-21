@@ -98,4 +98,14 @@ pub fn build(b: *std.Build) void {
     });
     const run_scanner_tests = b.addRunArtifact(scanner_tests);
     test_step.dependOn(&run_scanner_tests.step);
+
+    const ports_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/ports.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_ports_tests = b.addRunArtifact(ports_tests);
+    test_step.dependOn(&run_ports_tests.step);
 }
