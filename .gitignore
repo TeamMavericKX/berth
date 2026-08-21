@@ -1,0 +1,6 @@
+.zig-cache/
+zig-out/
+*.tar.gz
+*.sha256
+dist/
+.DS_Store
