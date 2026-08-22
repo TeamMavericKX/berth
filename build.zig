@@ -151,6 +151,17 @@ pub fn build(b: *std.Build) void {
     const run_trust_tests = b.addRunArtifact(trust_tests);
     test_step.dependOn(&run_trust_tests.step);
 
+    const clean_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/clean.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const run_clean_tests = b.addRunArtifact(clean_tests);
+    test_step.dependOn(&run_clean_tests.step);
+
     const containers_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/containers.zig"),

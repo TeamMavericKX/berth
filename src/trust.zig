@@ -63,10 +63,18 @@ fn exec(io: std.Io, gpa: std.mem.Allocator, argv: []const []const u8) Error!void
 }
 
 fn execReal(io: std.Io, gpa: std.mem.Allocator, argv: []const []const u8) Error!void {
-    _ = std.process.run(gpa, io, .{ .argv = argv }) catch |err| switch (err) {
+    const result = std.process.run(gpa, io, .{ .argv = argv }) catch |err| switch (err) {
         error.FileNotFound => return Error.UnsupportedPlatform,
         else => return Error.CommandFailed,
     };
+    // Non-zero exits surface as errors below; the streams themselves
+    // are ours to release.
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+    switch (result.term) {
+        .exited => |code| if (code != 0) return Error.CommandFailed,
+        else => return Error.CommandFailed,
+    }
 }
 
 fn exists(io: std.Io, path: []const u8) bool {

@@ -39,16 +39,12 @@ pub fn pathsFor(gpa: std.mem.Allocator, dir: []const u8, hostname: []const u8) !
 /// Ensure the CA exists and a valid leaf is signed for hostname.
 /// Returns the leaf cert path. Idempotent: existing valid files are
 /// reused untouched (mint twice = identical bytes).
-pub fn ensureLeaf(io: std.Io, gpa: std.mem.Allocator, dir: []const u8, hostname: []const u8) ![]const u8 {
-    switch (builtin.os.tag) {
-        .linux, .macos => {},
-        else => return Error.UnsupportedPlatform,
-    }
-
-    // Nested creation: walk the components (dirs here are shallow).
+/// Ensure the CA exists (and is current) in dir. Returns the CA cert
+/// path. Split out of ensureLeaf so `berth trust` can install trust
+/// without minting a leaf nobody asked for.
+pub fn ensureCA(io: std.Io, gpa: std.mem.Allocator, dir: []const u8) ![]const u8 {
     ensureDir(io, dir) catch return Error.OpensslFailed;
-
-    const p = try pathsFor(gpa, dir, hostname);
+    const p = try pathsFor(gpa, dir, "");
 
     if (!fileExists(io, p.ca_crt) or !fileExists(io, p.ca_key)) {
         _ = runOpenssl(io, gpa, &.{ "ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", p.ca_key }) catch |err| return err;
@@ -57,12 +53,34 @@ pub fn ensureLeaf(io: std.Io, gpa: std.mem.Allocator, dir: []const u8, hostname:
             reportLastFailure(gpa);
             return Error.OpensslFailed;
         }
-    } else if (!caValid(io, gpa, p)) {
+    } else if (!caValid(io, gpa, .{
+        .ca_key = p.ca_key,
+        .ca_crt = p.ca_crt,
+        .leaf_key = "",
+        .leaf_crt = "",
+        .ext_file = "",
+    })) {
         // Regenerate the whole CA rather than risk mixed identities.
         std.Io.Dir.deleteFileAbsolute(io, p.ca_crt) catch {};
         std.Io.Dir.deleteFileAbsolute(io, p.ca_key) catch {};
-        return ensureLeaf(io, gpa, dir, hostname);
+        return ensureCA(io, gpa, dir);
     }
+    return p.ca_crt;
+}
+
+pub fn ensureLeaf(io: std.Io, std_gpa: std.mem.Allocator, dir: []const u8, hostname: []const u8) ![]const u8 {
+    switch (builtin.os.tag) {
+        .linux, .macos => {},
+        else => return Error.UnsupportedPlatform,
+    }
+
+    // Nested creation: walk the components (dirs here are shallow).
+    ensureDir(io, dir) catch return Error.OpensslFailed;
+
+    _ = try ensureCA(io, std_gpa, dir);
+
+    const gpa = std_gpa;
+    const p = try pathsFor(gpa, dir, hostname);
 
     if (fileExists(io, p.leaf_crt) and fileExists(io, p.leaf_key)) {
         if (leafValid(io, gpa, p)) return p.leaf_crt;
@@ -107,7 +125,7 @@ fn checkEnd(io: std.Io, gpa: std.mem.Allocator, crt: []const u8) bool {
 }
 
 fn ensureDir(io: std.Io, path: []const u8) !void {
-    std.Io.Dir.createDirAbsolute(io, path, .default_dir) catch |err| switch (err) {
+    std.Io.Dir.cwd().createDirPath(io, path) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };

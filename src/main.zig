@@ -5,6 +5,9 @@ const routes = @import("routes.zig");
 const hostsync = @import("hostsync.zig");
 const run_mod = @import("run.zig");
 const dash = @import("dash.zig");
+const certs = @import("certs.zig");
+const trust = @import("trust.zig");
+const clean = @import("clean.zig");
 
 pub const version = proxy.version;
 
@@ -31,6 +34,12 @@ pub fn main(init: std.process.Init) !void {
     }
     if (std.mem.eql(u8, cmd, "run")) {
         return cmdRun(init.io, init.gpa, init.environ_map, &it);
+    }
+    if (std.mem.eql(u8, cmd, "trust")) {
+        return cmdTrust(init.io, init.gpa, init.environ_map);
+    }
+    if (std.mem.eql(u8, cmd, "clean")) {
+        return cmdClean(init.io, init.gpa, init.environ_map, &it);
     }
 
     usageFail("unknown command", cmd);
@@ -360,6 +369,113 @@ fn printVersion() !void {
     std.debug.print("berth {s}\n", .{version});
 }
 
+/// `berth trust`: mint the CA if needed, install it into this
+/// platform's trust store, then verify the anchor landed. Idempotent.
+fn cmdTrust(io: std.Io, gpa: std.mem.Allocator, env: *const std.process.Environ.Map) !void {
+    const home = env.get("HOME") orelse env.get("USERPROFILE") orelse {
+        std.debug.print("berth: cannot determine home directory\n", .{});
+        std.process.exit(1);
+    };
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = std.fmt.bufPrint(&dir_buf, "{s}/.berth", .{home}) catch unreachable;
+
+    const ca_crt = certs.ensureCA(io, gpa, dir) catch |err| switch (err) {
+        certs.Error.OpensslMissing => {
+            std.debug.print("berth: openssl not found; install it (apt install openssl / brew install openssl)\n", .{});
+            std.process.exit(1);
+        },
+        else => {
+            std.debug.print("berth: minting CA failed ({s})\n", .{@errorName(err)});
+            std.process.exit(1);
+        },
+    };
+
+    trust.installCA(io, gpa, env, ca_crt) catch |err| switch (err) {
+        trust.Error.UnsupportedPlatform => {
+            std.debug.print("berth: trust installation not supported on this platform yet\n", .{});
+            std.process.exit(1);
+        },
+        else => {
+            std.debug.print("berth: trust installation failed ({s}); the CA is at {s}\n", .{ @errorName(err), ca_crt });
+            std.process.exit(1);
+        },
+    };
+
+    // Verify after: the anchor must be readable where the flow put it.
+    std.debug.print(
+        "berth: local CA installed and trusted\n" ++
+            "  cert: {s}\n" ++
+            "  restart your browser, then visit any <name>.localhost URL\n",
+        .{ca_crt},
+    );
+}
+
+/// `berth clean [--yes]`: remove state dir, trust entry, hosts block,
+/// asking before each destructive step. Non-TTY without --yes fails
+/// fast having changed nothing.
+fn cmdClean(io: std.Io, gpa: std.mem.Allocator, env: *const std.process.Environ.Map, it: *std.process.Args.Iterator) !void {
+    var yes = false;
+    while (it.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--yes")) {
+            yes = true;
+        } else {
+            usageFail("unknown flag for clean", arg);
+        }
+    }
+
+    const interactive = clean.isInteractive();
+    if (!yes and !interactive) {
+        std.debug.print(
+            "berth: refusing to clean without --yes in a non-interactive shell\n" ++
+                "  nothing was changed. rerun with --yes to skip prompts.\n",
+            .{},
+        );
+        std.process.exit(1);
+    }
+
+    const home = env.get("HOME") orelse env.get("USERPROFILE") orelse {
+        std.debug.print("berth: cannot determine home directory\n", .{});
+        std.process.exit(1);
+    };
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const state_dir = std.fmt.bufPrint(&dir_buf, "{s}/.berth", .{home}) catch unreachable;
+
+    std.debug.print("berth: cleaning berth from this machine\n", .{});
+    const steps = clean.runClean(.{
+        .io = io,
+        .gpa = gpa,
+        .env = env,
+        .state_dir = state_dir,
+        .hosts_path = "/etc/hosts",
+        .yes = yes,
+        .interactive = interactive,
+    }) catch |err| switch (err) {
+        clean.Error.NonInteractive => unreachable, // handled above
+        else => {
+            std.debug.print("berth: clean failed ({s})\n", .{@errorName(err)});
+            std.process.exit(1);
+        },
+    };
+
+    defer gpa.free(steps);
+    var any_failed = false;
+    for (steps) |step| {
+        switch (step.outcome) {
+            .done => std.debug.print("  removed: {s}\n", .{step.label}),
+            .skipped => std.debug.print("  kept: {s}\n", .{step.label}),
+            .failed => {
+                std.debug.print("  FAILED: {s} (may need manual cleanup)\n", .{step.label});
+                any_failed = true;
+            },
+        }
+    }
+    if (any_failed) {
+        std.debug.print("berth: finished with errors\n", .{});
+        std.process.exit(1);
+    }
+    std.debug.print("berth: done\n", .{});
+}
+
 fn printHelp() !void {
     std.debug.print(
         \\berth {s} - one daemon, both worlds
@@ -367,6 +483,8 @@ fn printHelp() !void {
         \\usage:
         \\  berth serve [--host 127.0.0.1] [--port 8080]   run the proxy (loopback only)
         \\  berth run [--name NAME] -- CMD...              spawn CMD with PORT set and a name.localhost route
+        \\  berth trust                                    install the local CA into this machine's trust store
+        \\  berth clean [--yes]                            remove state, trust entry, and hosts block
         \\  berth version                                  print version
         \\  berth help                                     this text
         \\
