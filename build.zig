@@ -188,6 +188,17 @@ pub fn build(b: *std.Build) void {
     const run_inject_tests = b.addRunArtifact(inject_tests);
     test_step.dependOn(&run_inject_tests.step);
 
+    const tunnel_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tunnel.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const run_tunnel_tests = b.addRunArtifact(tunnel_tests);
+    test_step.dependOn(&run_tunnel_tests.step);
+
     const containers_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/containers.zig"),

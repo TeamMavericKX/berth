@@ -47,6 +47,8 @@ pub const RegisteredApp = struct {
     port: u16,
     category: []const u8,
     pid: ?i32,
+    /// tailscale authority like "box.tail1234.ts.net" when exposed.
+    tunnel: ?[]const u8 = null,
 };
 
 pub const ContainerPort = struct {

@@ -11,6 +11,7 @@ const trust = @import("trust.zig");
 const clean = @import("clean.zig");
 const worktree = @import("worktree.zig");
 const inject = @import("inject.zig");
+const tunnel = @import("tunnel.zig");
 
 pub const version = proxy.version;
 
@@ -117,7 +118,7 @@ fn collectLiveRoutes(gpa: std.mem.Allocator) ?[]routes.Route {
     const listed = s.listRoutes(gpa) catch return null;
     const live = gpa.alloc(routes.Route, listed.len) catch return null;
     for (listed, 0..) |r, i| {
-        live[i] = .{ .hostname = r.hostname, .port = r.port };
+        live[i] = .{ .hostname = r.hostname, .port = r.port, .tunnel_authority = r.tunnel_authority };
     }
     return live;
 }
@@ -144,6 +145,7 @@ fn provideRegistered(gpa: std.mem.Allocator) anyerror![]@import("ports.zig").Reg
                 .port = r.port,
                 .category = "other",
                 .pid = r.pid,
+                .tunnel = r.tunnel_authority,
             });
         }
 
@@ -312,6 +314,7 @@ fn syncHostsFile(io: std.Io, gpa: std.mem.Allocator, env: *const std.process.Env
 /// spawn CMD, register name.localhost while it lives, deregister on exit.
 fn cmdRun(io: std.Io, gpa: std.mem.Allocator, env: *const std.process.Environ.Map, it: *std.process.Args.Iterator) !void {
     var explicit_name: ?[]const u8 = null;
+    var use_tunnel: enum { off, serve, funnel } = .off;
     var argv_list: std.ArrayList([]const u8) = .empty;
 
     while (it.next()) |arg| {
@@ -322,6 +325,14 @@ fn cmdRun(io: std.Io, gpa: std.mem.Allocator, env: *const std.process.Environ.Ma
         if (std.mem.eql(u8, arg, "--")) continue;
         if (std.mem.eql(u8, arg, "--name")) {
             explicit_name = it.next() orelse usageFail("--name requires a value", "");
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--tailscale")) {
+            use_tunnel = .serve;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--funnel")) {
+            use_tunnel = .funnel;
             continue;
         }
         if (arg.len > 0 and arg[0] == '-') usageFail("unknown flag for run", arg);
@@ -352,14 +363,17 @@ fn cmdRun(io: std.Io, gpa: std.mem.Allocator, env: *const std.process.Environ.Ma
     run_store = openStore(io, gpa, env) orelse std.process.exit(2);
     const s = &run_store.?;
 
-    // Fail fast when a live process already owns the name.
+    // Fail fast when a LIVE process already owns the name. Stale rows
+    // from crashed runs are replaceable, not conflicts.
     var probe_buf: [256]u8 = undefined;
     if (s.lookupRoute(&probe_buf, hostname) catch null) |existing| {
-        std.debug.print(
-            "berth: {s} is already registered by pid {d}\n",
-            .{ hostname, existing.pid },
-        );
-        std.process.exit(3);
+        if (db.pidAlive(existing.pid)) {
+            std.debug.print(
+                "berth: {s} is already registered by pid {d}\n",
+                .{ hostname, existing.pid },
+            );
+            std.process.exit(3);
+        }
     }
 
     var seed: [8]u8 = undefined;
@@ -415,6 +429,23 @@ fn cmdRun(io: std.Io, gpa: std.mem.Allocator, env: *const std.process.Environ.Ma
     syncHostsFromStore(io, gpa, env);
 
     std.debug.print("berth: {s} -> 127.0.0.1:{d} (pid {d})\n", .{ hostname, port, child_pid });
+
+    // Tunnel garnish: the app already runs locally; a tailscale miss
+    // only costs the share link, never the app.
+    if (use_tunnel != .off) {
+        if (!tunnel.ready(io, gpa)) {
+            std.debug.print("berth: tailscale unavailable (binary or daemon missing); serving locally only\n", .{});
+        } else switch (tunnel.expose(io, gpa, port, use_tunnel == .funnel)) {
+            .ok => |url| {
+                const authority = tunnel.urlToAuthority(url) orelse url;
+                s.setTunnelAuthority(hostname, authority) catch {};
+                std.debug.print("berth: exposed at {s}\n", .{url});
+            },
+            .err => |e| {
+                std.debug.print("berth: tailscale serve failed ({s}); serving locally only\n", .{@errorName(e)});
+            },
+        }
+    }
 
     const term = child.wait(io) catch |err| {
         std.debug.print("berth: wait failed ({s}); releasing route\n", .{@errorName(err)});
