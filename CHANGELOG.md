@@ -4,6 +4,21 @@ All notable changes to berth are documented here. Format follows Keep a Changelo
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-23
+
+### Added
+
+- Pro console: live SSE updates, instant search, stats strip, origin badges, ts.net tunnel chips, hover actions with context menu and toasts (#68)
+- Console instrument skin in the ThreeUI language extracted from research: JetBrains Mono voice, hairline borders, near-black surfaces, single vermilion accent (#74, #76)
+- New landing page in the kage design language: receipt-backed comparison table, typed berth contract section, house rules, FAQ with native disclosures, OG meta and inline SVG favicon — still one file, zero JS, zero external resources (#69, #75, #79)
+- README rebuilt for launch: badges, six-command quickstart, feature proof table, architecture sketch, honest known-limits section (#70)
+
+### Fixed
+
+- Renames and kills answered forbidden when the console was opened at `berth.localhost`: the CSRF origin allowlist now matches the router's reserved names exactly (#82)
+- Sticky headers jumped against the browser bezel on first scroll; both surfaces now rest and pin at identical offsets (#84)
+- Daemon abort (general protection fault) when a dashboard mutation raced the five-second refresh tick over one shared arena; refresh passes are serialized behind a mutex with a concurrency regression test (#86)
+
 ## [0.2.0] - 2026-08-22
 
 ### Added
