@@ -140,6 +140,17 @@ pub fn build(b: *std.Build) void {
     const run_tls_tests = b.addRunArtifact(tls_tests);
     test_step.dependOn(&run_tls_tests.step);
 
+    const trust_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/trust.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const run_trust_tests = b.addRunArtifact(trust_tests);
+    test_step.dependOn(&run_trust_tests.step);
+
     const containers_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/containers.zig"),
