@@ -73,9 +73,16 @@ fn hub() *Hub {
     return hub_instance.?;
 }
 
+/// Serializes refreshOnce: the background tick and inline post-mutation
+/// refreshes share one scratch arena, and concurrent build+reset passes
+/// freed entry slices under each other (general protection fault).
+var refresh_mutex: std.Io.Mutex = .init;
+
 /// Build entries from providers + a live scan and publish. Runs on the
 /// refresh thread and after every mutation.
 pub fn refreshOnce(io: std.Io) void {
+    refresh_mutex.lockUncancelable(io);
+    defer refresh_mutex.unlock(io);
     const scratch = scratch_state.allocator();
     defer _ = scratch_state.reset(.retain_capacity);
 
@@ -649,4 +656,54 @@ test "bearer comparison matches exactly" {
         for (p.got, expected) |a, b| diff |= a ^ b;
         try std.testing.expectEqual(p.want, diff == 0);
     }
+}
+
+test "concurrent refreshOnce stays serialized and publishes valid snapshots" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const io = std.testing.io;
+
+    const Stub = struct {
+        fn reg(gpa: std.mem.Allocator) anyerror![]ports.RegisteredApp {
+            const list = try gpa.alloc(ports.RegisteredApp, 128);
+            @memset(list, .{ .name = "stress-name-with-\"quotes\"", .port = 4000, .category = "web", .pid = 1 });
+            for (list, 0..) |*e, i| e.port = @intCast(4000 + (i % 500));
+            return list;
+        }
+        fn tags(gpa: std.mem.Allocator) anyerror![]db.TagColor {
+            const list = try gpa.alloc(db.TagColor, 16);
+            @memset(list, .{ .category = "web", .color = "#2563eb" });
+            return list;
+        }
+    };
+    registered_provider = &Stub.reg;
+    tags_provider = &Stub.tags;
+    defer {
+        registered_provider = null;
+        tags_provider = null;
+    }
+
+    var hub_store: Hub = .{ .io = io };
+    setHub(&hub_store);
+    _ = &arena;
+
+    const Worker = struct {
+        fn run(parent: std.mem.Allocator) void {
+            var a = std.heap.ArenaAllocator.init(parent);
+            defer a.deinit();
+            for (0..2) |_| refreshOnce(io_thread(a.allocator()));
+        }
+        fn io_thread(_: std.mem.Allocator) std.Io {
+            return std.testing.io;
+        }
+    };
+
+    var threads: [4]std.Thread = undefined;
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Worker.run, .{std.testing.allocator});
+    for (&threads) |*t| t.join();
+
+    const snap = hub().current();
+    try std.testing.expect(snap.gen >= 1);
+    try std.testing.expect(std.mem.startsWith(u8, snap.payload, "{\"tags\":"));
+    try std.testing.expect(std.mem.indexOf(u8, snap.payload, "\\\"quotes\\\"") != null);
 }
