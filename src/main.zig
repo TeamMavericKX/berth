@@ -12,6 +12,7 @@ const clean = @import("clean.zig");
 const worktree = @import("worktree.zig");
 const inject = @import("inject.zig");
 const tunnel = @import("tunnel.zig");
+const svc = @import("svc.zig");
 
 pub const version = proxy.version;
 
@@ -44,6 +45,9 @@ pub fn main(init: std.process.Init) !void {
     }
     if (std.mem.eql(u8, cmd, "clean")) {
         return cmdClean(init.io, init.gpa, init.environ_map, &it);
+    }
+    if (std.mem.eql(u8, cmd, "service")) {
+        return cmdService(init.io, init.gpa, init.environ_map, &it);
     }
 
     usageFail("unknown command", cmd);
@@ -592,6 +596,76 @@ fn cmdClean(io: std.Io, gpa: std.mem.Allocator, env: *const std.process.Environ.
     std.debug.print("berth: done\n", .{});
 }
 
+/// `berth service install|uninstall|status`: user-level service units.
+fn cmdService(io: std.Io, gpa: std.mem.Allocator, env: *const std.process.Environ.Map, it: *std.process.Args.Iterator) !void {
+    const sub = it.next() orelse usageFail("service needs a subcommand", "  install | uninstall | status");
+    const home = env.get("HOME") orelse env.get("USERPROFILE") orelse {
+        std.debug.print("berth: cannot determine home directory\n", .{});
+        std.process.exit(1);
+    };
+
+    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const exe_len = std.Io.Dir.cwd().readLink(io, "/proc/self/exe", &exe_buf) catch {
+        std.debug.print("berth: cannot locate own binary\n", .{});
+        std.process.exit(1);
+    };
+    const exe_path = exe_buf[0..exe_len];
+
+    if (svc.homebrewManaged(exe_path)) {
+        std.debug.print(
+            "berth: this install is Homebrew-managed\n" ++
+                "  run `brew services start berth` instead; writing a competing unit would fight brew\n",
+            .{},
+        );
+        std.process.exit(1);
+    }
+
+    if (std.mem.eql(u8, sub, "install")) {
+        const unit_path = svc.writeUnit(io, gpa, home, exe_path) catch |err| switch (err) {
+            svc.Error.UnsupportedPlatform => usageFail("service units unsupported on this platform", ""),
+            svc.Error.HomebrewManaged => unreachable,
+            else => {
+                std.debug.print("berth: could not write unit ({s})\n", .{@errorName(err)});
+                std.process.exit(1);
+            },
+        };
+        defer gpa.free(unit_path);
+        svc.startService(io, gpa, home) catch |err| {
+            std.debug.print("berth: unit written at {s} but start failed ({s})\n", .{ unit_path, @errorName(err) });
+            std.process.exit(1);
+        };
+        const manager = svc.detectManager() catch svc.Manager.systemd;
+        std.debug.print("berth: installed and started ({s})\n", .{unit_path});
+        std.debug.print("  logs: {s}\n", .{svc.logPath(manager, home)});
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "uninstall")) {
+        svc.stopService(io, gpa, home) catch {};
+        if (svc.removeUnit(io, gpa, home)) |unit_path| gpa.free(unit_path);
+        std.debug.print("berth: service removed\n", .{});
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "status")) {
+        const st = svc.status(io, gpa) catch |err| switch (err) {
+            svc.Error.UnsupportedPlatform => usageFail("service units unsupported on this platform", ""),
+            else => {
+                std.debug.print("berth: status query failed ({s})\n", .{@errorName(err)});
+                std.process.exit(1);
+            },
+        };
+        std.debug.print("berth: manager={s} running={s} startup={s}\n", .{
+            st.manager,
+            if (st.running) "yes" else "no",
+            if (st.enabled_at_startup) "enabled" else "disabled",
+        });
+        return;
+    }
+
+    usageFail("unknown service subcommand", sub);
+}
+
 fn printHelp() !void {
     std.debug.print(
         \\berth {s} - one daemon, both worlds
@@ -601,6 +675,7 @@ fn printHelp() !void {
         \\  berth run [--name NAME] -- CMD...              spawn CMD with PORT set and a name.localhost route
         \\  berth trust                                    install the local CA into this machine's trust store
         \\  berth clean [--yes]                            remove state, trust entry, and hosts block
+        \\  berth service install|uninstall|status         user-level proxy service (survives reboots)
         \\  berth version                                  print version
         \\  berth help                                     this text
         \\

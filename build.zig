@@ -199,6 +199,17 @@ pub fn build(b: *std.Build) void {
     const run_tunnel_tests = b.addRunArtifact(tunnel_tests);
     test_step.dependOn(&run_tunnel_tests.step);
 
+    const svc_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/svc.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const run_svc_tests = b.addRunArtifact(svc_tests);
+    test_step.dependOn(&run_svc_tests.step);
+
     const containers_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/containers.zig"),
