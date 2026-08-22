@@ -136,7 +136,7 @@ pub fn sync(
     const cwd = std.Io.Dir.cwd();
     const file = cwd.createFile(io, tmp_path, .{
         .truncate = true,
-        .permissions = .fromMode(0o644),
+        .permissions = .default_file,
     }) catch return error.NotWritable;
     var wbuf: [4096]u8 = undefined;
     var writer = file.writer(io, &wbuf);
@@ -152,6 +152,60 @@ pub fn sync(
 
     std.Io.Dir.renameAbsolute(tmp_path, hosts_path, io) catch return error.NotWritable;
     return .synced;
+}
+
+/// Strip the managed block entirely; everything outside the markers
+/// survives byte-for-byte. Shared write path with sync().
+pub fn removeBlock(io: std.Io, gpa: std.mem.Allocator, hosts_path: []const u8) Error!Outcome {
+    const old = std.Io.Dir.cwd().readFileAlloc(io, hosts_path, gpa, .limited(4 * 1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => return .unchanged, // nothing to clean
+        else => return error.NotWritable,
+    };
+    defer gpa.free(old);
+
+    const updated = try stripBlock(gpa, old);
+    defer gpa.free(updated);
+    if (std.mem.eql(u8, old, updated)) return .unchanged;
+
+    const tmp_path = try std.fmt.allocPrint(gpa, "{s}.berth-tmp", .{hosts_path});
+    defer gpa.free(tmp_path);
+
+    const cwd = std.Io.Dir.cwd();
+    const file = cwd.createFile(io, tmp_path, .{
+        .truncate = true,
+        .permissions = .default_file,
+    }) catch return error.NotWritable;
+    var wbuf: [4096]u8 = undefined;
+    var writer = file.writer(io, &wbuf);
+    writer.interface.writeAll(updated) catch {
+        file.close(io);
+        return error.NotWritable;
+    };
+    writer.interface.flush() catch {
+        file.close(io);
+        return error.NotWritable;
+    };
+    file.close(io);
+
+    std.Io.Dir.renameAbsolute(tmp_path, hosts_path, io) catch return error.NotWritable;
+    return .synced;
+}
+
+fn stripBlock(allocator: std.mem.Allocator, contents: []const u8) Error![]u8 {
+    const start_idx = std.mem.indexOf(u8, contents, start_marker) orelse
+        return allocator.dupe(u8, contents); // no block: byte-identical
+
+    const end_idx = std.mem.indexOfPos(u8, contents, start_idx, end_marker) orelse
+        return allocator.dupe(u8, contents); // unterminated block: leave alone
+
+    // Extend to full lines: back up to the newline before start_marker,
+    // advance past the newline after end_marker.
+    var cut_begin = start_idx;
+    while (cut_begin > 0 and contents[cut_begin - 1] != '\n') cut_begin -= 1;
+    var cut_end = end_idx + end_marker.len;
+    if (cut_end < contents.len and contents[cut_end] == '\n') cut_end += 1;
+
+    return std.mem.concat(allocator, u8, &.{ contents[0..cut_begin], contents[cut_end..] });
 }
 
 test "block lists every hostname on loopback" {
@@ -290,4 +344,20 @@ test "unwritable target returns NotWritable instead of crashing" {
     try std.testing.expectError(error.NotWritable, result);
 
     _ = std.c.chmod(locked_z.ptr, 0o700);
+}
+
+test "strip removes only the managed block byte-exactly" {
+    const a = std.testing.allocator;
+    const original = "127.0.0.1 localhost\n" ++
+        "# berth-start\n127.0.0.1 old.host\n# berth-end\n" ++
+        "::1 localhost\n";
+    const stripped = try stripBlock(a, original);
+    defer a.free(stripped);
+    try std.testing.expectEqualStrings("127.0.0.1 localhost\n::1 localhost\n", stripped);
+
+    // No block at all: caller sees unchanged without any rewrite.
+    const plain = "127.0.0.1 localhost\n";
+    const untouched = try stripBlock(a, plain);
+    defer a.free(untouched);
+    try std.testing.expectEqualStrings(plain, untouched);
 }
