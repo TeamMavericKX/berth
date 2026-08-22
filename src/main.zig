@@ -9,6 +9,7 @@ const certs = @import("certs.zig");
 const tls = @import("tls.zig");
 const trust = @import("trust.zig");
 const clean = @import("clean.zig");
+const worktree = @import("worktree.zig");
 
 pub const version = proxy.version;
 
@@ -332,8 +333,18 @@ fn cmdRun(io: std.Io, gpa: std.mem.Allocator, env: *const std.process.Environ.Ma
     if (cwd_n == 0) usageFail("could not resolve working directory", "");
     const cwd = cwd_buf[0..cwd_n];
 
-    const name = run_mod.inferName(io, gpa, cwd, explicit_name) orelse
+    const base = run_mod.inferName(io, gpa, cwd, explicit_name) orelse
         usageFail("could not infer a name; pass --name", "");
+    // Linked worktrees prefix the name with the sanitized branch tail
+    // so parallel sessions never collide. Explicit --name opts out:
+    // the user said what they want.
+    var name: []const u8 = base;
+    if (explicit_name == null) {
+        if (worktree.prefixFor(io, gpa, cwd)) |prefix| {
+            defer gpa.free(prefix);
+            name = std.fmt.allocPrint(gpa, "{s}-{s}", .{ prefix, base }) catch base;
+        }
+    }
     var host_buf: [256]u8 = undefined;
     const hostname = run_mod.deriveHostname(&host_buf, name);
 
