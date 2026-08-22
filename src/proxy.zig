@@ -8,7 +8,7 @@ const net = std.Io.net;
 const routes_mod = @import("routes.zig");
 const dash = @import("dash.zig");
 
-pub const version = "0.1.0";
+pub const version = "0.2.0";
 
 /// TLS backend built once at serve start when compiled with openssl;
 /// null keeps the port plaintext-only.

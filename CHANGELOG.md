@@ -4,6 +4,8 @@ All notable changes to berth are documented here. Format follows Keep a Changelo
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-22
+
 ### Added
 
 - Project governance: README, CONTRIBUTING with the six-word commit law, Apache-2.0 license
