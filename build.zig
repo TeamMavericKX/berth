@@ -23,6 +23,13 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // TLS termination needs a system OpenSSL; cross-compile targets and
+    // CI matrix jobs build without it and get stubs that fail closed.
+    const openssl = b.option(bool, "openssl", "Link system OpenSSL for TLS termination (M3)") orelse false;
+
+    const opts = b.addOptions();
+    opts.addOption(bool, "openssl", openssl);
+
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -117,6 +124,21 @@ pub fn build(b: *std.Build) void {
     certs_tests.root_module.link_libc = true;
     const run_certs_tests = b.addRunArtifact(certs_tests);
     test_step.dependOn(&run_certs_tests.step);
+
+    const tls_mod = b.createModule(.{
+        .root_source_file = b.path("src/tls.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    tls_mod.addOptions("build_options", opts);
+    if (openssl) {
+        tls_mod.link_libc = true;
+        tls_mod.linkSystemLibrary("ssl", .{});
+        tls_mod.linkSystemLibrary("crypto", .{});
+    }
+    const tls_tests = b.addTest(.{ .root_module = tls_mod });
+    const run_tls_tests = b.addRunArtifact(tls_tests);
+    test_step.dependOn(&run_tls_tests.step);
 
     const containers_tests = b.addTest(.{
         .root_module = b.createModule(.{

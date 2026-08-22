@@ -34,6 +34,25 @@ jobs:
       - name: Test
         run: zig build test
 
+  tls:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Zig 0.16.0
+        run: |
+          curl -fsSL --retry 5 --retry-delay 5 \
+            "https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz" \
+            -o /tmp/zig.tar.xz
+          mkdir -p "$HOME/.zig"
+          tar -xJf /tmp/zig.tar.xz -C "$HOME/.zig" --strip-components=1
+          echo "$HOME/.zig" >> "$GITHUB_PATH"
+      - name: Zig version
+        run: zig version
+      # Exercises the SNI/ALPN suite including the curl receipts; the
+      # default build-test jobs compile the stub path only.
+      - name: Test with OpenSSL linked
+        run: zig build test -Dopenssl=true
+
   cross-compile:
     runs-on: ubuntu-latest
     strategy:
