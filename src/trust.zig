@@ -250,6 +250,7 @@ fn resetSeams(gpa: std.mem.Allocator) void {
 }
 
 test "debian flow copies anchor then updates; untrust reverses exactly" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
     const io = std.testing.io;
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -306,6 +307,7 @@ test "debian flow copies anchor then updates; untrust reverses exactly" {
 }
 
 test "wsl handles both stores on install and both on untrust" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
     const io = std.testing.io;
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -366,6 +368,7 @@ test "wsl handles both stores on install and both on untrust" {
 }
 
 test "failed update step preserves anchor for safe retry" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
     const io = std.testing.io;
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
