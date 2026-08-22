@@ -35,7 +35,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    exe_mod.addOptions("build_options", opts);
     linkSqlite(b, exe_mod);
+    if (openssl) {
+        exe_mod.linkSystemLibrary("ssl", .{});
+        exe_mod.linkSystemLibrary("crypto", .{});
+    }
 
     const exe = b.addExecutable(.{
         .name = "berth",

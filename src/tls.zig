@@ -12,6 +12,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const certs = @import("certs.zig");
+const Io = std.Io;
 
 pub const enabled = build_options.openssl and switch (builtin.os.tag) {
     .linux, .macos => true,
@@ -415,3 +416,127 @@ fn fileFingerprintHex(io: std.Io, path: []const u8, gpa: std.mem.Allocator) ![]u
     std.crypto.hash.sha2.Sha256.hash(der[0..der_len], &digest, .{});
     return std.fmt.allocPrint(gpa, "{x}", .{&digest});
 }
+
+/// A TLS-terminated connection presenting the same reader/writer shape
+/// as std.Io.net.Stream, so the h1 handler runs unchanged over it.
+pub const Conn = struct {
+    session: Session,
+
+    pub fn close(self: *Conn) void {
+        self.session.close();
+    }
+
+    pub fn reader(self: *Conn, io: Io, buffer: []u8) TlsReader {
+        return .init(self, io, buffer);
+    }
+
+    pub fn writer(self: *Conn, io: Io, buffer: []u8) TlsWriter {
+        return .init(self, io, buffer);
+    }
+};
+
+pub const TlsReader = struct {
+    io: Io,
+    interface: Io.Reader,
+    conn: *Conn,
+    err: ?anyerror = null,
+
+    pub fn init(conn: *Conn, io: Io, buffer: []u8) TlsReader {
+        return .{
+            .io = io,
+            .conn = conn,
+            .interface = .{
+                .vtable = &.{
+                    .stream = streamImpl,
+                    .readVec = readVecImpl,
+                },
+                .buffer = buffer,
+                .seek = 0,
+                .end = 0,
+            },
+        };
+    }
+
+    fn streamImpl(io_r: *Io.Reader, io_w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
+        const dest = limit.slice(try io_w.writableSliceGreedy(1));
+        var data: [1][]u8 = .{dest};
+        const n = try readVecImpl(io_r, &data);
+        io_w.advance(n);
+        return n;
+    }
+
+    fn readVecImpl(io_r: *Io.Reader, data: [][]u8) Io.Reader.Error!usize {
+        const r: *TlsReader = @alignCast(@fieldParentPtr("interface", io_r));
+        var iovecs_buffer: [1][]u8 = undefined;
+        const dest_n, const data_size = try io_r.writableVector(&iovecs_buffer, data);
+        const dest = iovecs_buffer[0..dest_n];
+        if (comptime !enabled) return error.ReadFailed;
+        // SSL_read fills one contiguous span: dest[0] only. Bytes past
+        // data_size landed in the interface's own buffer, which the core
+        // cannot see unless we advance .end ourselves (fillMore calls
+        // this with empty data precisely for that path).
+        const n = r.conn.session.read(dest[0]) catch |err| {
+            r.err = err;
+            return error.ReadFailed;
+        };
+        if (n == 0) return error.EndOfStream;
+        if (n > data_size) {
+            io_r.end += n - data_size;
+            return data_size;
+        }
+        return n;
+    }
+};
+
+pub const TlsWriter = struct {
+    io: Io,
+    interface: Io.Writer,
+    conn: *Conn,
+    err: ?anyerror = null,
+
+    pub fn init(conn: *Conn, io: Io, buffer: []u8) TlsWriter {
+        return .{
+            .io = io,
+            .conn = conn,
+            .interface = .{
+                .vtable = &.{
+                    .drain = drainImpl,
+                    .sendFile = sendFileImpl,
+                },
+                .buffer = buffer,
+            },
+        };
+    }
+
+    fn drainImpl(io_w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+        const w: *TlsWriter = @alignCast(@fieldParentPtr("interface", io_w));
+        if (comptime !enabled) return error.WriteFailed;
+        // Buffer first, then each slice; last element written `splat`
+        // times total per the drain contract.
+        w.conn.session.writeAll(io_w.buffered()) catch |err| {
+            w.err = err;
+            return error.WriteFailed;
+        };
+        io_w.end = 0;
+        var consumed: usize = 0;
+        for (data, 0..) |d, i| {
+            const repeats: usize = if (i + 1 == data.len) splat else 1;
+            var k: usize = 0;
+            while (k < repeats) : (k += 1) {
+                w.conn.session.writeAll(d) catch |err| {
+                    w.err = err;
+                    return error.WriteFailed;
+                };
+            }
+            consumed += d.len;
+        }
+        return consumed;
+    }
+
+    fn sendFileImpl(io_w: *Io.Writer, file_reader: *Io.File.Reader, limit: Io.Limit) Io.Writer.FileError!usize {
+        _ = io_w;
+        _ = file_reader;
+        _ = limit;
+        return error.Unimplemented;
+    }
+};

@@ -6,6 +6,7 @@ const hostsync = @import("hostsync.zig");
 const run_mod = @import("run.zig");
 const dash = @import("dash.zig");
 const certs = @import("certs.zig");
+const tls = @import("tls.zig");
 const trust = @import("trust.zig");
 const clean = @import("clean.zig");
 
@@ -77,6 +78,9 @@ fn cmdServe(io: std.Io, init_gpa: std.mem.Allocator, env: *const std.process.Env
 
     if (loadStoredRoutes(io, init_gpa, env)) |live| {
         syncHostsFile(io, init_gpa, env, live);
+        initTlsBackend(io, init_gpa, env, live);
+    } else {
+        initTlsBackend(io, init_gpa, env, &.{});
     }
     startDashboard(io, cfg.port, env);
     proxy.serve(io, cfg) catch |err| switch (err) {
@@ -224,6 +228,57 @@ fn loadStoredRoutes(io: std.Io, gpa: std.mem.Allocator, env: *const std.process.
 /// Mirror stored routes into /etc/hosts inside the managed marker block.
 /// BERTH_SYNC_HOSTS=0 opts out; an unwritable hosts file degrades to a
 /// warning that shows the exact block to add by hand.
+/// Build the TLS backend from the live route table: mint CA and one
+/// leaf per enabled host, default-cert on localhost for unknown SNI.
+/// Failure degrades to plaintext-only serve with a warning, never a
+/// crash — TLS is a feature, not a dependency.
+fn initTlsBackend(io: std.Io, gpa: std.mem.Allocator, env: *const std.process.Environ.Map, live: []const routes.Route) void {
+    if (comptime !tls.enabled) return;
+    const home = env.get("HOME") orelse env.get("USERPROFILE") orelse return;
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = std.fmt.bufPrint(&dir_buf, "{s}/.berth", .{home}) catch return;
+
+    const ca_crt = certs.ensureCA(io, gpa, dir) catch |err| {
+        std.debug.print("berth: tls disabled (ca mint failed: {s})\n", .{@errorName(err)});
+        return;
+    };
+    const ca_key = std.fmt.allocPrint(gpa, "{s}/ca.key", .{dir}) catch return;
+
+    var hosts = gpa.alloc(tls.HostCert, live.len + 1) catch return;
+    var n: usize = 0;
+    for (live) |r| {
+        const leaf_crt = certs.ensureLeaf(io, gpa, dir, r.hostname) catch continue;
+        hosts[n] = .{ .host = r.hostname, .paths = .{
+            .ca_key = ca_key,
+            .ca_crt = ca_crt,
+            .leaf_key = std.fmt.allocPrint(gpa, "{s}/{s}.key", .{ dir, r.hostname }) catch continue,
+            .leaf_crt = leaf_crt,
+            .ext_file = "",
+        } };
+        n += 1;
+    }
+    // Default cert answers unknown SNI.
+    const dflt_leaf = certs.ensureLeaf(io, gpa, dir, "localhost") catch {
+        std.debug.print("berth: tls disabled (default cert mint failed)\n", .{});
+        return;
+    };
+
+    proxy.tls_backend = tls.start(gpa, hosts[0..n], .{
+        .host = "localhost",
+        .paths = .{
+            .ca_key = ca_key,
+            .ca_crt = ca_crt,
+            .leaf_key = std.fmt.allocPrint(gpa, "{s}/localhost.key", .{dir}) catch return,
+            .leaf_crt = dflt_leaf,
+            .ext_file = "",
+        },
+    }) catch |err| {
+        std.debug.print("berth: tls disabled ({s})\n", .{@errorName(err)});
+        return;
+    };
+    proxy.tls_active = true;
+}
+
 fn syncHostsFile(io: std.Io, gpa: std.mem.Allocator, env: *const std.process.Environ.Map, live: []const routes.Route) void {
     const enabled = if (env.get("BERTH_SYNC_HOSTS")) |v|
         !std.mem.eql(u8, v, "0")
