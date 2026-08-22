@@ -249,6 +249,12 @@ pub fn renderEntriesJson(
         } else {
             try writer.writeAll("null");
         }
+        try writer.writeAll(",\"tunnel\":");
+        if (e.tunnel) |t| {
+            try writeJsonString(writer, t);
+        } else {
+            try writer.writeAll("null");
+        }
         try writer.writeAll("}");
     }
     try writer.writeAll("]}");
