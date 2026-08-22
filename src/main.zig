@@ -10,6 +10,7 @@ const tls = @import("tls.zig");
 const trust = @import("trust.zig");
 const clean = @import("clean.zig");
 const worktree = @import("worktree.zig");
+const inject = @import("inject.zig");
 
 pub const version = proxy.version;
 
@@ -377,6 +378,24 @@ fn cmdRun(io: std.Io, gpa: std.mem.Allocator, env: *const std.process.Environ.Ma
     var port_buf: [8]u8 = undefined;
     const port_str = std.fmt.bufPrint(&port_buf, "{d}", .{port}) catch unreachable;
     child_env.put("PORT", port_str) catch std.process.exit(2);
+
+    // Frameworks that ignore PORT get real flags appended. Every
+    // decision logs at debug level so users can audit what happened.
+    switch (inject.decide(argv_list.items)) {
+        .none => {},
+        .refused => |reason| proxy.logDebug("port injection refused", &.{
+            "cmd",    argv_list.items[0],
+            "reason", @tagName(reason),
+        }),
+        .inject => |inj| {
+            var pbuf2: [8]u8 = undefined;
+            const pstr = std.fmt.bufPrint(&pbuf2, "{d}", .{port}) catch unreachable;
+            try argv_list.append(gpa, "--port");
+            try argv_list.append(gpa, pstr);
+            if (inj.strict_flag) |sf| try argv_list.append(gpa, sf);
+            proxy.logDebug("port flags injected", &.{ "cmd", argv_list.items[0] });
+        },
+    }
 
     var child = std.process.spawn(io, .{
         .argv = argv_list.items,

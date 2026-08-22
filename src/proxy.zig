@@ -454,7 +454,7 @@ fn logLine(level: []const u8, msg: []const u8, kv: []const []const u8) void {
 /// afterwards which is fine for a logging on/off switch.
 pub var debug_enabled: bool = false;
 
-fn logDebug(msg: []const u8, kv: []const []const u8) void {
+pub fn logDebug(msg: []const u8, kv: []const []const u8) void {
     if (!debug_enabled) return;
     logLine("debug", msg, kv);
 }
