@@ -1,10 +1,23 @@
 const std = @import("std");
+const builtin = @import("builtin");
+const tls = @import("tls.zig");
+const certs = @import("certs.zig");
+const db = @import("db.zig");
 const http = std.http;
 const net = std.Io.net;
 const routes_mod = @import("routes.zig");
 const dash = @import("dash.zig");
 
 pub const version = "0.1.0";
+
+/// TLS backend built once at serve start when compiled with openssl;
+/// null keeps the port plaintext-only.
+pub var tls_backend: ?tls.Backend = null;
+pub var tls_active: bool = false;
+/// One connection per thread, so a threadlocal carries whether the
+/// current connection was TLS-demuxed without threading a parameter
+/// through every handler.
+threadlocal var conn_is_tls: bool = false;
 
 /// Errors the proxy listener can surface to the CLI layer, which owns
 /// presentation (docs/conventions.md: propagate or own).
@@ -51,10 +64,36 @@ fn connectionThread(ctx: *ConnCtx) void {
         ctx.stream.close(ctx.io);
         std.heap.page_allocator.destroy(ctx);
     }
+
+    // Peek the first byte without consuming: 0x16 is a TLS
+    // ClientHello's content type (handshake). Everything else is
+    // plaintext and flows through the h1 loop, which redirects to
+    // https while TLS is active (except websocket upgrades).
+    if (comptime builtin.os.tag != .windows) {
+        var peek: [1]u8 = undefined;
+        const fd = ctx.stream.socket.handle;
+        const n = std.c.recv(fd, &peek, 1, 0x2); // MSG_PEEK (linux + macos)
+        if (n == 1 and peek[0] == 0x16) {
+            if (comptime tls.enabled) {
+                if (tls_backend) |*backend| {
+                    const session = tls.accept(backend, ctx.stream) catch {
+                        return; // failed handshake: drop quietly
+                    };
+                    var conn = tls.Conn{ .session = session };
+                    defer conn.close();
+                    conn_is_tls = true;
+                    defer conn_is_tls = false;
+                    serveConnection(&conn, ctx.io) catch |err| logErr("connection ended", err);
+                    return;
+                }
+            }
+        }
+    }
+
     serveConnection(ctx.stream, ctx.io) catch |err| logErr("connection ended", err);
 }
 
-fn serveConnection(stream: net.Stream, io: std.Io) !void {
+fn serveConnection(stream: anytype, io: std.Io) !void {
     const allocator = std.heap.page_allocator;
 
     const read_buf = try allocator.alloc(u8, 64 * 1024);
@@ -302,6 +341,29 @@ fn isDashboardTarget(target: []const u8, raw_host: []const u8) bool {
 
 fn handleRequest(request: *http.Server.Request, io: std.Io) !void {
     const target = request.head.target;
+
+    // While TLS is active on this port, plaintext requests redirect to
+    // their https twin. WebSocket upgrades pass through: clients cannot
+    // follow redirects mid-handshake.
+    if (comptime tls.enabled) {
+        if (tls_active and !conn_is_tls and request.head.method == .GET) {
+            var up_buf: [32]u8 = undefined;
+            const upgrade = findHeaderValue(request, "upgrade", &up_buf) orelse "";
+            if (!std.ascii.eqlIgnoreCase(upgrade, "websocket")) {
+                var hb: [256]u8 = undefined;
+                const host = findHeaderValue(request, "host", &hb) orelse "";
+                if (host.len > 0) {
+                    var loc_buf: [512]u8 = undefined;
+                    const location = std.fmt.bufPrint(&loc_buf, "https://{s}{s}", .{ host, target }) catch return;
+                    try request.respond("", .{
+                        .status = .moved_permanently,
+                        .extra_headers = &.{.{ .name = "location", .value = location }},
+                    });
+                    return;
+                }
+            }
+        }
+    }
 
     if (std.mem.eql(u8, target, "/healthz")) {
         try request.respond("ok\n", .{
