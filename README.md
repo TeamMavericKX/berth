@@ -28,7 +28,7 @@ berth run -- npm run dev
 # berth: myapi.localhost -> 127.0.0.1:4312 (pid 48221)
 
 berth trust                 # local CA installed; https URLs work in browsers
-berth serve                 # dashboard on :8080 — live ports, containers, kill buttons
+berth serve                 # console on :8090 — also answers at http://berth.localhost:8090
 berth service install       # survives reboots; user-level unit, still zero sudo
 berth clean --yes           # leave with zero residue
 ```
