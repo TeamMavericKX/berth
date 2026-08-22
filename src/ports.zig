@@ -9,6 +9,8 @@ pub const PortEntry = struct {
     origin: Origin,
     alive: bool,
     pid: ?i32 = null,
+    /// tailscale authority when the route is exposed (registered only).
+    tunnel: ?[]const u8 = null,
 
     pub const Origin = enum {
         registered,
@@ -84,6 +86,7 @@ pub fn buildPortEntries(
             .origin = .registered,
             .alive = open_set.contains(app.port),
             .pid = app.pid,
+            .tunnel = app.tunnel,
         });
     }
 
