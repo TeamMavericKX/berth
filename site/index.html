@@ -1,0 +1,334 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>berth — one daemon, two superpowers</title>
+<meta name="description" content="berth gives local dev servers stable https://name.localhost URLs and an agent-readable dashboard. One small Zig binary, no sudo, no runtime.">
+<style>
+  :root {
+    --bg: #faf7f2;
+    --ink: #1c1917;
+    --muted: #6b6459;
+    --line: #e5ded2;
+    --accent: #0f766e;
+    --accent-ink: #ffffff;
+    --card: #ffffff;
+    --warn: #b45309;
+    --code-bg: #141210;
+    --code-ink: #e8e2d6;
+    --good: #15803d;
+    --bad: #b91c1c;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #12100e;
+      --ink: #ece5d8;
+      --muted: #a39a8b;
+      --line: #2b2721;
+      --accent: #2dd4bf;
+      --accent-ink: #04211d;
+      --card: #1a1713;
+      --code-bg: #000000;
+      --code-ink: #d8d1c2;
+      --good: #4ade80;
+      --bad: #f87171;
+    }
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html { scroll-behavior: smooth; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: ui-sans-serif, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+  }
+  code, pre, .mono {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  .wrap { max-width: 1060px; margin: 0 auto; padding: 0 24px; }
+
+  header.hero { padding: 72px 0 40px; }
+  .kicker {
+    display: inline-block;
+    font-size: 13px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--accent);
+    border: 1px solid var(--accent);
+    border-radius: 999px;
+    padding: 4px 14px;
+    margin-bottom: 22px;
+  }
+  h1 {
+    font-size: clamp(38px, 7vw, 68px);
+    line-height: 1.04;
+    letter-spacing: -0.02em;
+    font-weight: 800;
+    max-width: 15ch;
+  }
+  h1 em { font-style: normal; color: var(--accent); }
+  .sub {
+    margin-top: 18px;
+    font-size: clamp(17px, 2.2vw, 21px);
+    color: var(--muted);
+    max-width: 58ch;
+  }
+  .sub strong { color: var(--ink); }
+
+  .demo {
+    margin: 34px 0 8px;
+    background: var(--code-bg);
+    color: var(--code-ink);
+    border-radius: 12px;
+    padding: 22px 24px;
+    font-size: 14.5px;
+    overflow-x: auto;
+  }
+  .demo .p { color: var(--accent); }
+  .demo .c { color: #8a8375; }
+
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 1px;
+    background: var(--line);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    overflow: hidden;
+    margin: 26px 0 0;
+  }
+  .stat { background: var(--card); padding: 16px 18px; }
+  .stat b { display: block; font-size: 26px; letter-spacing: -0.02em; }
+  .stat span { font-size: 13px; color: var(--muted); }
+
+  section { padding: 46px 0; }
+  h2 {
+    font-size: clamp(24px, 3.4vw, 32px);
+    letter-spacing: -0.015em;
+    margin-bottom: 10px;
+  }
+  .lede { color: var(--muted); max-width: 62ch; margin-bottom: 26px; }
+
+  .cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 14px;
+  }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 18px 20px;
+  }
+  .card h3 { font-size: 16px; margin-bottom: 6px; }
+  .card p { font-size: 14.5px; color: var(--muted); }
+  .card p b { color: var(--ink); }
+
+  table.compare {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 14.5px;
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    overflow: hidden;
+  }
+  table.compare th, table.compare td {
+    text-align: left;
+    padding: 11px 14px;
+    border-bottom: 1px solid var(--line);
+    vertical-align: top;
+  }
+  table.compare tr:last-child td { border-bottom: none; }
+  table.compare th {
+    font-size: 12.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+    background: var(--card);
+  }
+  td.yes { color: var(--good); font-weight: 600; }
+  td.no { color: var(--bad); }
+  td.mid { color: var(--warn); }
+  .tblwrap { overflow-x: auto; }
+
+  a { color: var(--accent); }
+  .receipts { font-size: 13.5px; color: var(--muted); }
+  .receipts li { margin: 4px 0 4px 18px; }
+  .receipts code { font-size: 12.5px; }
+
+  footer {
+    border-top: 1px solid var(--line);
+    padding: 30px 0 60px;
+    font-size: 13.5px;
+    color: var(--muted);
+  }
+
+  @media print {
+    body { background: #fff; color: #000; }
+    header.hero { padding-top: 12px; }
+    section { padding: 18px 0; page-break-inside: avoid; }
+    .demo { background: #f2f0eb !important; color: #111 !important; border: 1px solid #ccc; }
+    .card, .stats, table.compare { border-color: #bbb; }
+    a { color: inherit; text-decoration: none; }
+  }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+
+<header class="hero">
+  <span class="kicker">berth · one binary · zig</span>
+  <h1>One daemon.<br>Two <em>superpowers.</em></h1>
+  <p class="sub">
+    <strong>portless</strong> gave dev servers stable <strong>https://name.localhost</strong> URLs and demanded your sudo, your Node&nbsp;24, and a root CA.
+    <strong>portmap</strong> gave agents an honest dashboard and refused to touch TLS at all.
+    <strong>berth is both halves, minus the taxes.</strong>
+  </p>
+
+  <div class="demo">
+<pre><span class="c"># every app gets a real URL — parallel worktrees never collide</span>
+<span class="p">$</span> berth run -- npm run dev
+berth: myapi.localhost -> 127.0.0.1:4312 (pid 48221)
+
+<span class="c"># frameworks that ignore PORT get real flags, not vibes</span>
+<span class="p">$</span> berth run -- vite dev
+berth: viteapp.localhost -> 127.0.0.1:4377 (pid 48330)
+
+<span class="c"># share it: one flag, your tailnet, still zero sudo</span>
+<span class="p">$</span> berth run --funnel -- python -m http.server
+berth: exposed at https://box.tail1234.ts.net</pre>
+  </div>
+
+  <div class="stats">
+    <div class="stat"><b>2</b><span>vendored deps: sqlite3.c + OpenSSL</span></div>
+    <div class="stat"><b>5</b><span>cross-compiled targets per commit</span></div>
+    <div class="stat"><b>0</b><span>sudo, ever — high ports, user services</span></div>
+    <div class="stat"><b>0</b><span>JS bytes on this page</span></div>
+  </div>
+</header>
+
+<section id="how">
+  <h2>The whole job, in one listener</h2>
+  <p class="lede">
+    berth peeks the first byte of each connection — the same trick portless
+    uses — and routes TLS to the certificate layer while plaintext flows to the
+    HTTP router. Named URLs land on high ports, so there is nothing to elevate,
+    and /etc/hosts gets one managed block that cleans up after itself.
+  </p>
+  <div class="cards">
+    <div class="card"><h3>Named HTTPS, honestly</h3>
+      <p>A local CA minted by the <b>openssl binary you already have</b> — never linked crypto for certificates — signs per-host leaves cached in ~/.berth/certs. Unknown hostnames fall back instead of failing.</p></div>
+    <div class="card"><h3>An agent-first dashboard</h3>
+      <p>portmap's best idea, kept: send <b>Accept: text/markdown</b> and get the full status page plus API reference as markdown. Humans get HTML; LLMs self-discover kill, label, and refresh endpoints.</p></div>
+    <div class="card"><h3>Kill with a receipt</h3>
+      <p>SIGTERM every listener on a port, poll zombie-aware for 2 seconds, SIGKILL only survivors, then tell you which thing happened. No lsof dependency, no orphaned children.</p></div>
+    <div class="card"><h3>Containers speak up</h3>
+      <p>Docker and Podman sockets are polled over plain HTTP-on-a-unix-socket; published ports surface as candidates tagged <b>origin=container</b>. Mystery listeners stop being mysteries.</p></div>
+    <div class="card"><h3>Mutations wear seatbelts</h3>
+      <p>Kill and edit endpoints check Origin against localhost and honor a bearer token. portmap shipped permissive CORS on a kill endpoint; berth closes that door from day one.</p></div>
+    <div class="card"><h3>Worktrees just work</h3>
+      <p>Linked git worktrees prefix names with the branch tail — <b>feature/auth becomes auth-myapp</b> — while your root checkout stays exactly as named. Parallel sessions never collide.</p></div>
+  </div>
+</section>
+
+<section id="compare">
+  <h2>Against both parents</h2>
+  <p class="lede">Every cell traces to our research dossiers, which cite source lines. We ported solutions, not reverence.</p>
+  <div class="tblwrap">
+  <table class="compare">
+    <thead><tr>
+      <th></th><th>berth</th><th>portless v0.15.5</th><th>portmap v0.8.1</th>
+    </tr></thead>
+    <tbody>
+      <tr><td>Runtime</td>
+        <td class="yes">none (static Zig)</td>
+        <td class="no">Node ≥ 24</td>
+        <td class="yes">none (Rust binary)</td></tr>
+      <tr><td>Stable name.localhost URLs</td>
+        <td class="yes">yes</td><td class="yes">yes</td><td class="no">no</td></tr>
+      <tr><td>HTTPS termination</td>
+        <td class="yes">OpenSSL, SNI-selected</td>
+        <td class="mid">Node TLS, needs sudo :443</td>
+        <td class="no">none</td></tr>
+      <tr><td>Privileges needed</td>
+        <td class="yes">zero</td>
+        <td class="no">sudo + root CA</td>
+        <td class="yes">zero</td></tr>
+      <tr><td>/etc/hosts management</td>
+        <td class="yes">marker block, reversible</td>
+        <td class="yes">marker block</td>
+        <td class="no">no</td></tr>
+      <tr><td>Live port scan + claim</td>
+        <td class="yes">yes, on demand only</td>
+        <td class="no">no</td>
+        <td class="yes">yes</td></tr>
+      <tr><td>Markdown for agents</td>
+        <td class="yes">Accept-negotiated</td>
+        <td class="no">no</td>
+        <td class="yes">yes</td></tr>
+      <tr><td>Dashboard mutation auth</td>
+        <td class="yes">Origin allowlist + token</td>
+        <td class="mid">n/a (no mutations)</td>
+        <td class="no">permissive CORS</td></tr>
+      <tr><td>Kill ladder</td>
+        <td class="yes">TERM → 2s → KILL, zombie-aware</td>
+        <td class="no">—</td>
+        <td class="yes">same idea</td></tr>
+      <tr><td>Docker/Podman discovery</td>
+        <td class="yes">unix socket, no SDK</td>
+        <td class="no">no</td>
+        <td class="yes">bollard SDK</td></tr>
+      <tr><td>Service mode</td>
+        <td class="yes">user units, reboot-safe</td>
+        <td class="mid">system daemons</td>
+        <td class="no">no</td></tr>
+      <tr><td>Tailscale expose</td>
+        <td class="yes">--tailscale / --funnel</td>
+        <td class="yes">built-in</td>
+        <td class="no">no</td></tr>
+      <tr><td>State store</td>
+        <td class="yes">SQLite (vendored amalgamation)</td>
+        <td class="mid">JSON + lock dance</td>
+        <td class="yes">SQLite</td></tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<section id="install">
+  <h2>Install &amp; first run</h2>
+  <p class="lede">Five-minute human guide lives in <a href="docs/guide.md">docs/guide.md</a>; the agent contract is <a href="docs/agents.md">docs/agents.md</a>.</p>
+  <div class="demo">
+<pre><span class="c"># build once — no runtime, no npm install, no node_modules</span>
+<span class="p">$</span> git clone https://github.com/TeamMavericKX/berth && cd berth
+<span class="p">$</span> zig build -Doptimize=ReleaseSafe
+
+<span class="p">$</span> berth run -- npm run dev        <span class="c"># URL printed; ctrl-c cleans up</span>
+<span class="p">$</span> berth trust                     <span class="c"># https URLs browsers believe</span>
+<span class="p">$</span> berth service install           <span class="c"># survives reboots, still no sudo</span>
+<span class="p">$</span> berth clean --yes               <span class="c"># leave with zero residue</span></pre>
+  </div>
+</section>
+
+<section id="receipts">
+  <h2>Receipts or it didn't happen</h2>
+  <p class="lede">The claims above are audited, not asserted. Source-of-truth documents, each with file:line citations:</p>
+  <ul class="receipts">
+    <li><a href="docs/research/portless-dossier.md">docs/research/portless-dossier.md</a> — ~25,100 lines TS, 42 files; the byte-peek demux (proxy.ts:690-706), framework injection table (cli-utils.ts:1095-1140), cert-by-spawned-openssl (certs.ts:231).</li>
+    <li><a href="docs/research/portmap-dossier.md">docs/research/portmap-dossier.md</a> — ~4,344 lines Rust; markdown self-description (lib.rs:597+), the kill ladder (process.rs:66-125), the permissive-CORS flaw this project refuses to inherit (lib.rs:79).</li>
+    <li><a href="docs/research/zig-feasibility.md">docs/research/zig-feasibility.md</a> — module-by-module feasibility verified against installed Zig 0.16, including why std has no TLS server and what that forced.</li>
+    <li><a href="docs/adr/">docs/adr/</a> — decisions with fallback plans: h1-first (ADR-0001), SQLite amalgamation (0002), linked OpenSSL + spawned openssl CLI (0003), scan-on-demand only (0004).</li>
+  </ul>
+</section>
+
+<footer>
+  berth — Apache-2.0. Built by humans and agents working the same repo, which is the point.
+</footer>
+
+</div>
+</body>
+</html>
