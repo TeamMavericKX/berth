@@ -167,6 +167,17 @@ pub fn build(b: *std.Build) void {
     const run_clean_tests = b.addRunArtifact(clean_tests);
     test_step.dependOn(&run_clean_tests.step);
 
+    const worktree_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/worktree.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const run_worktree_tests = b.addRunArtifact(worktree_tests);
+    test_step.dependOn(&run_worktree_tests.step);
+
     const containers_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/containers.zig"),
