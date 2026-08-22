@@ -260,7 +260,7 @@ test "homebrew cellar installs delegate instead of writing units" {
 }
 
 test "linux writes user unit then start cycle and uninstall leave nothing" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
     const io = std.testing.io;
     const gpa = std.testing.allocator;
     exec_impl = TestRecorder.record;
