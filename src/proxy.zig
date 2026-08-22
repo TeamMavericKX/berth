@@ -325,15 +325,16 @@ fn stripPort(raw_host: []const u8) []const u8 {
     return lowered;
 }
 
-/// Dashboard endpoints live on the bare loopback host only, so named
-/// app routes keep working: myapp.localhost/ still reaches the app.
+/// Dashboard endpoints live on the bare loopback hosts plus the reserved
+/// console name, so named app routes keep working: myapp.localhost/ still
+/// reaches the app, berth.localhost/ reaches this UI.
 fn isDashboardTarget(target: []const u8, raw_host: []const u8) bool {
     if (!std.mem.eql(u8, target, "/") and
         !std.mem.eql(u8, target, "/markdown") and
         !std.mem.startsWith(u8, target, "/events") and
         !std.mem.startsWith(u8, target, "/api/")) return false;
     const host = stripPort(raw_host);
-    inline for (.{ "localhost", "127.0.0.1", "::1", "[::1]" }) |ok| {
+    inline for (.{ "localhost", "127.0.0.1", "::1", "[::1]", "berth.localhost", "berth" }) |ok| {
         if (std.mem.eql(u8, host, ok)) return true;
     }
     return host.len == 0;
@@ -535,6 +536,22 @@ test "validate config refuses non-loopback" {
     try std.testing.expectEqual(@as(?[]const u8, null), configRefusal(.{ .host = "::1" }));
     try std.testing.expectEqualStrings("0.0.0.0", configRefusal(.{ .host = "0.0.0.0" }).?);
     try std.testing.expectEqualStrings("192.168.1.10", configRefusal(.{ .host = "192.168.1.10" }).?);
+}
+
+test "dashboard target accepts loopback and reserved console names" {
+    const targets = [_][]const u8{ "/", "/markdown", "/api/ports", "/events" };
+    const hosts = [_][]const u8{
+        "localhost:8090",       "127.0.0.1:8090", "[::1]:8090",
+        "berth.localhost:8090", "berth:8090",     "",
+    };
+    for (targets) |target| {
+        for (hosts) |host| {
+            try std.testing.expect(isDashboardTarget(target, host));
+        }
+        try std.testing.expect(!isDashboardTarget(target, "myapi.localhost:4312"));
+        try std.testing.expect(!isDashboardTarget(target, "viteapp"));
+    }
+    try std.testing.expect(!isDashboardTarget("/other", "localhost:8090"));
 }
 
 test "resolve address localhost maps to ipv4 loopback" {
