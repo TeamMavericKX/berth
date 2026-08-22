@@ -5,6 +5,13 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>berth — one daemon, two superpowers</title>
 <meta name="description" content="berth gives local dev servers stable https://name.localhost URLs and an agent-readable dashboard. One small Zig binary, no sudo, no runtime.">
+<meta property="og:type" content="website">
+<meta property="og:title" content="berth — one daemon, two superpowers">
+<meta property="og:description" content="Named https URLs for dev servers plus an agent-readable console. One static Zig binary — no sudo, no runtime, no taxes.">
+<meta name="twitter:card" content="summary">
+<meta name="theme-color" content="#05070a" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#e9e7df" media="(prefers-color-scheme: light)">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect x='3' y='3' width='10' height='10' rx='2' fill='%23e0231c'/%3E%3C/svg%3E">
 <style>
 :root{
   --ink:#05070a; --ink-2:#0a0e12;
@@ -129,6 +136,26 @@ h2::before{content:"§ ";color:var(--vermilion)}
 .card p b{color:var(--bone)}
 @media(max-width:860px){.card,.card.b7,.card.b5,.card.b8,.card.b12{grid-column:span 12}}
 
+.principles{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+.principle{border:.5px solid var(--line-soft);border-radius:9px;background:var(--ink-2);padding:20px 22px}
+.principle h3{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--ember);margin-bottom:8px;font-weight:700}
+.principle p{font-size:13px;color:var(--muted)}
+@media(max-width:860px){.principles{grid-template-columns:1fr}}
+
+.faq{max-width:76ch}
+.faq details{border-bottom:.5px solid var(--line-soft);padding:6px 0}
+.faq summary{
+  cursor:pointer;list-style:none;display:flex;align-items:center;gap:14px;
+  font-size:13.5px;color:var(--bone);min-height:44px;
+}
+.faq summary::-webkit-details-marker{display:none}
+.faq summary::before{content:"+";color:var(--vermilion);font-size:16px;width:14px;flex:none;transition:transform .18s var(--ease)}
+.faq details[open] summary::before{transform:rotate(45deg)}
+.faq details p{font-size:13px;color:var(--muted);padding:4px 0 12px 28px}
+.faq code{font-size:12px;background:var(--ink-2);border:.5px solid var(--line);border-radius:5px;padding:1px 7px}
+
+.scrollhint{display:none;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);text-align:right;padding:8px 15px 0}
+
 .tblwrap{overflow-x:auto;border:.5px solid var(--line);border-radius:9px;background:var(--ink-2)}
 table{width:100%;border-collapse:collapse;font-size:12.5px;min-width:660px}
 th,td{text-align:left;padding:10px 15px;border-bottom:.5px solid var(--line-soft)}
@@ -174,6 +201,16 @@ footer{border-top:.5px solid var(--line);margin-top:64px;padding:36px 0 68px;fon
 @media (prefers-reduced-motion:reduce){
   *{animation:none!important;transition:none!important}
   html{scroll-behavior:auto}
+  .faq summary::before{transition:none}
+}
+@media(max-width:720px){
+  .cue{display:none}
+  .scrollhint{display:block}
+  h1{max-width:none}
+  .contract td{display:block;width:auto;padding:9px var(--pad)}
+  .contract td:first-child{width:auto;padding-bottom:0;color:var(--ember)}
+  .term pre{font-size:11px;line-height:1.7}
+  .dl .btn{flex:1;text-align:center}
 }
 @media print{
   body{background:#fff!important;color:#000}
@@ -199,6 +236,7 @@ footer{border-top:.5px solid var(--line);margin-top:64px;padding:36px 0 68px;fon
     <a href="#how">features</a>
     <a href="#compare">compare</a>
     <a href="#contract">contract</a>
+    <a href="#faq">faq</a>
     <a href="#install">install</a>
     <a href="#receipts">receipts</a>
   </div>
@@ -269,6 +307,7 @@ berth: exposed at <span class="u">https://box.tail1234.ts.net</span></pre>
 <section id="compare">
   <h2>Against both parents</h2>
   <p class="lede">Every cell traces to our research dossiers, which cite source lines. We ported solutions, not reverence.</p>
+  <div class="scrollhint">swipe →</div>
   <div class="tblwrap">
   <table>
     <thead><tr><th></th><th>berth</th><th>portless v0.15.5</th><th>portmap v0.8.1</th></tr></thead>
@@ -291,6 +330,16 @@ berth: exposed at <span class="u">https://box.tail1234.ts.net</span></pre>
   </div>
 </section>
 
+<section id="principles">
+  <h2>House rules</h2>
+  <p class="lede">Three commitments every feature is measured against. When a PR breaks one, the PR changes.</p>
+  <div class="principles">
+    <div class="principle"><h3>Receipts over claims</h3><p>Every comparison cell, contract row and benchmark traces to a dossier with file:line citations — or it gets deleted from this page.</p></div>
+    <div class="principle"><h3>Loopback by default</h3><p>Nothing leaves your machine unless you type an expose flag. The scanner only ever knocks on 127.0.0.1, and clean --yes removes every trace.</p></div>
+    <div class="principle"><h3>Agents are first-class</h3><p>The console answers Accept: text/markdown with the same truth humans get. If an agent can't discover it, it isn't done.</p></div>
+  </div>
+</section>
+
 <section id="contract">
   <h2>The berth contract</h2>
   <p class="lede">Borrowed from component spec sheets: what this daemon promises, typed and bounded. Each row is enforced by tests in CI.</p>
@@ -310,7 +359,7 @@ berth: exposed at <span class="u">https://box.tail1234.ts.net</span></pre>
 
 <section id="install">
   <h2>Install &amp; first run</h2>
-  <p class="lede">Prebuilt static binaries for five platforms ship with every release. The five-minute human guide lives in <a href="docs/guide.md">docs/guide.md</a>; the agent contract is <a href="docs/agents.md">docs/agents.md</a>.</p>
+  <p class="lede">Prebuilt static binaries for five platforms ship with every release. The five-minute human guide lives in <a href="https://github.com/TeamMavericKX/berth/blob/main/docs/guide.md">docs/guide.md</a>; the agent contract is <a href="https://github.com/TeamMavericKX/berth/blob/main/docs/agents.md">docs/agents.md</a>.</p>
   <div class="dl">
     <a class="btn primary" href="https://github.com/TeamMavericKX/berth/releases/tag/v0.2.0">download v0.2.0 — linux · macos · windows</a>
     <a class="btn" href="https://github.com/TeamMavericKX/berth">source on github</a>
@@ -328,14 +377,40 @@ berth: exposed at <span class="u">https://box.tail1234.ts.net</span></pre>
   </div>
 </section>
 
+<section id="faq">
+  <h2>Obvious questions</h2>
+  <div class="faq">
+    <details>
+      <summary>Seriously zero sudo? Even for HTTPS?</summary>
+      <p>Even then. URLs land on high ports so there is no privileged bind, certificates come from a CA your own openssl binary mints into ~/.berth, and service mode installs user-level units. The one thing that touches system files is the /etc/hosts marker block, and it is optional, bounded, and reversible.</p>
+    </details>
+    <details>
+      <summary>Why can't I drop the port from the URL like production?</summary>
+      <p>Bare names imply port 443, and binding 443 unprivileged needs kernel cooperation — exactly portless's sudo tax. berth keeps every byte of its promise instead: honest high ports with real TLS on them. A socket-activation helper could bridge that gap later without long-running root; it is deliberately not shipped yet.</p>
+    </details>
+    <details>
+      <summary>HTTP/1.1 only — will HMR and websockets work?</summary>
+      <p>Yes. Upgrades pass through untouched, so Vite, Next and friends hot-reload normally. What you do not get is multiplexed h2 — std has no HTTP/2 server (ADR-0001), and faking it badly seemed worse than skipping it honestly.</p>
+    </details>
+    <details>
+      <summary>What about Windows?</summary>
+      <p>The CLI builds and runs everywhere five targets are tested, but TLS, service units and hosts management are POSIX-only today. Windows is a first-class cross-compile target so the core stays honest, not a pretend port.</p>
+    </details>
+    <details>
+      <summary>How do I leave?</summary>
+      <p><code>berth clean --yes</code>. Routes, certs, CA trust, services and the hosts block all go in one pass, and it refuses to run without the flag from a non-TTY so scripts never nuke by accident.</p>
+    </details>
+  </div>
+</section>
+
 <section id="receipts">
   <h2>Receipts or it didn't happen</h2>
   <p class="lede">The claims above are audited, not asserted. Source-of-truth documents, each with file:line citations:</p>
   <ul class="receipts">
-    <li><a href="docs/research/portless-dossier.md">docs/research/portless-dossier.md</a> — ~25,100 lines TS, 42 files; the byte-peek demux (<code>proxy.ts:690-706</code>), framework injection table (<code>cli-utils.ts:1095-1140</code>), cert-by-spawned-openssl (<code>certs.ts:231</code>).</li>
-    <li><a href="docs/research/portmap-dossier.md">docs/research/portmap-dossier.md</a> — ~4,344 lines Rust; markdown self-description (<code>lib.rs:597+</code>), the kill ladder (<code>process.rs:66-125</code>), the permissive-CORS flaw this project refuses to inherit (<code>lib.rs:79</code>).</li>
-    <li><a href="docs/research/zig-feasibility.md">docs/research/zig-feasibility.md</a> — module-by-module feasibility verified against installed Zig 0.16, including why std has no TLS server and what that forced.</li>
-    <li><a href="docs/adr/">docs/adr/</a> — decisions with fallback plans: h1-first (ADR-0001), SQLite amalgamation (0002), linked OpenSSL + spawned openssl CLI (0003), scan-on-demand only (0004).</li>
+    <li><a href="https://github.com/TeamMavericKX/berth/blob/main/docs/research/portless-dossier.md">docs/research/portless-dossier.md</a> — ~25,100 lines TS, 42 files; the byte-peek demux (<code>proxy.ts:690-706</code>), framework injection table (<code>cli-utils.ts:1095-1140</code>), cert-by-spawned-openssl (<code>certs.ts:231</code>).</li>
+    <li><a href="https://github.com/TeamMavericKX/berth/blob/main/docs/research/portmap-dossier.md">docs/research/portmap-dossier.md</a> — ~4,344 lines Rust; markdown self-description (<code>lib.rs:597+</code>), the kill ladder (<code>process.rs:66-125</code>), the permissive-CORS flaw this project refuses to inherit (<code>lib.rs:79</code>).</li>
+    <li><a href="https://github.com/TeamMavericKX/berth/blob/main/docs/research/zig-feasibility.md">docs/research/zig-feasibility.md</a> — module-by-module feasibility verified against installed Zig 0.16, including why std has no TLS server and what that forced.</li>
+    <li><a href="https://github.com/TeamMavericKX/berth/tree/main/docs/adr">docs/adr/</a> — decisions with fallback plans: h1-first (ADR-0001), SQLite amalgamation (0002), linked OpenSSL + spawned openssl CLI (0003), scan-on-demand only (0004).</li>
   </ul>
 </section>
 
