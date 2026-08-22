@@ -107,7 +107,7 @@ pub fn refreshOnce(io: std.Io) void {
 
     var md_writer = std.Io.Writer.Allocating.init(scratch);
     defer md_writer.deinit();
-    renderMarkdown(&md_writer.writer, entries) catch return;
+    renderMarkdown(&md_writer.writer, entries, registered) catch return;
 
     // Only rendered text escapes the tick; give it a stable home.
     const json = alloc.dupe(u8, json_writer.written()) catch return;
@@ -157,7 +157,7 @@ fn mdCell(writer: *std.Io.Writer, raw: []const u8) !void {
 
 /// Agent-facing status page: registered apps, live ports, full API
 /// reference with copy-paste curl lines. Pure for unit tests.
-pub fn renderMarkdown(writer: *std.Io.Writer, entries: []const PortEntry) !void {
+pub fn renderMarkdown(writer: *std.Io.Writer, entries: []const PortEntry, registered: []const ports.RegisteredApp) !void {
     try writer.print("# berth\n\nPortless dev proxy on this machine. Every registered app is reachable at its `http://<name>.localhost/` URL; this dashboard runs on port {d}. Ports {d}-{d} are scanned live every few seconds.\n\n", .{ dashboard_port, scan_range_start, scan_range_end });
 
     try writer.writeAll("## registered apps\n\n");
@@ -183,12 +183,22 @@ pub fn renderMarkdown(writer: *std.Io.Writer, entries: []const PortEntry) !void 
         try writer.writeAll("None yet. Start one via `berth run <name> -- <cmd>` or label a port with the edit endpoint below.\n");
     }
 
-    try writer.writeAll("\n## live ports\n\n| port | name | origin | pid |\n|---|---|---|---|\n");
+    try writer.writeAll("\n## live ports\n\n| port | name | origin | pid | tunnel |\n|---|---|---|---|---|\n");
     for (entries) |e| {
         try writer.print("| {d} | ", .{e.port});
         try mdCell(writer, e.name);
         try writer.print(" | {s} | ", .{@tagName(e.origin)});
         if (e.pid) |p| try writer.print("{d}", .{p}) else try writer.writeAll("-");
+        try writer.writeAll(" | ");
+        var tunneled = false;
+        for (registered) |r| {
+            if (r.port == e.port and r.tunnel != null) {
+                try mdCell(writer, r.tunnel.?);
+                tunneled = true;
+                break;
+            }
+        }
+        if (!tunneled) try writer.writeAll("-");
         try writer.writeAll(" |\n");
     }
 
@@ -569,12 +579,18 @@ test "markdown status page renders tables api reference and escapes pipes" {
         .{ .port = 4300, .name = "in|voice", .category = "api", .origin = .registered, .alive = true, .pid = 42 },
         .{ .port = 4400, .origin = .anonymous, .alive = true },
     };
-    try renderMarkdown(&writer, entries[0..]);
+    const reg = [_]ports.RegisteredApp{
+        .{ .name = "in|voice", .port = 4300, .category = "api", .pid = 42 },
+        .{ .name = "tunneled", .port = 4400, .category = "other", .pid = null, .tunnel = "box.tail.ts.net" },
+    };
+    try renderMarkdown(&writer, entries[0..], &reg);
     const out = writer.buffered();
 
     try std.testing.expect(std.mem.indexOf(u8, out, "# berth\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "| in\\|voice | http://in\\|voice.localhost/ | api | 4300 | yes |") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "| 4400 |  | anonymous | - |") != null);
+    // Tunnel authority surfaces on the row of its port.
+    try std.testing.expect(std.mem.indexOf(u8, out, "box.tail.ts.net") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "## api reference") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "curl http://localhost:") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "/api/edit?port=4300&name=myapp&category=web") != null);
@@ -582,7 +598,7 @@ test "markdown status page renders tables api reference and escapes pipes" {
 
     // Empty catalog renders the hint instead of a bare table header.
     var w2: std.Io.Writer = .fixed(&buf);
-    try renderMarkdown(&w2, &.{});
+    try renderMarkdown(&w2, &.{}, &.{});
     try std.testing.expect(std.mem.indexOf(u8, w2.buffered(), "None yet.") != null);
 }
 

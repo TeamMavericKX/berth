@@ -30,6 +30,7 @@ pub const Route = struct {
     port: u16,
     pid: i32,
     created_at: i64,
+    tunnel_authority: ?[]const u8 = null,
 };
 
 const schema_sql =
@@ -78,7 +79,7 @@ fn columnText(stmt: ?*c.sqlite3_stmt, idx: c_int) []const u8 {
     return @as([*]const u8, @ptrCast(ptr))[0..len];
 }
 
-fn pidAlive(pid: i32) bool {
+pub fn pidAlive(pid: i32) bool {
     switch (@import("builtin").os.tag) {
         .windows => return false,
         else => {},
@@ -124,6 +125,7 @@ pub fn ensureDataDir(io: std.Io, gpa: std.mem.Allocator, home: []const u8) !void
 /// transaction and is recorded in schema_migrations, so reopening applies
 /// every entry at most once, in file order.
 const migrations = [_][:0]const u8{
+    \\ALTER TABLE routes ADD COLUMN tunnel_authority TEXT;
     \\CREATE TABLE IF NOT EXISTS apps(
     \\  id INTEGER PRIMARY KEY,
     \\  name TEXT NOT NULL,
@@ -286,6 +288,30 @@ pub const Store = struct {
         try check(step_rc, self.handle);
     }
 
+    /// Attach (or clear with null) the tunnel authority for a hostname.
+    pub fn setTunnelAuthority(self: *Store, hostname: []const u8, authority: ?[]const u8) Error!void {
+        var stmt: ?*c.sqlite3_stmt = null;
+        const rc = c.sqlite3_prepare_v2(
+            self.handle,
+            "UPDATE routes SET tunnel_authority=?2 WHERE hostname=?1",
+            -1,
+            &stmt,
+            null,
+        );
+        try check(rc, self.handle);
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindText(stmt, 1, hostname);
+        if (authority) |a| {
+            // bindText, not raw bind_text: SQLITE_TRANSIENT trips
+            // alignment checks on aarch64 (see the note above).
+            try bindText(stmt, 2, a);
+        } else {
+            _ = c.sqlite3_bind_null(stmt, 2);
+        }
+        const step_rc = c.sqlite3_step(stmt);
+        try check(step_rc, self.handle);
+    }
+
     /// Overwrite port and pid for an existing hostname. Returns false when
     /// no row exists; callers wanting create-or-update semantics use
     /// insertRoute instead.
@@ -348,7 +374,7 @@ pub const Store = struct {
         var stmt: ?*c.sqlite3_stmt = null;
         const rc = c.sqlite3_prepare_v2(
             self.handle,
-            "SELECT hostname,port,pid,created_at FROM routes ORDER BY hostname",
+            "SELECT hostname,port,pid,created_at,tunnel_authority FROM routes ORDER BY hostname",
             -1,
             &stmt,
             null,
@@ -363,11 +389,16 @@ pub const Store = struct {
             try check(step_rc, self.handle);
             const stored = columnText(stmt, 0);
             const dup = try allocator.dupe(u8, stored);
+            const authority: ?[]const u8 = if (c.sqlite3_column_type(stmt, 4) == c.SQLITE_NULL)
+                null
+            else
+                try allocator.dupe(u8, columnText(stmt, 4));
             try routes.append(allocator, .{
                 .hostname = dup,
                 .port = @intCast(std.math.clamp(c.sqlite3_column_int(stmt, 1), 0, std.math.maxInt(u16))),
                 .pid = c.sqlite3_column_int(stmt, 2),
                 .created_at = c.sqlite3_column_int64(stmt, 3),
+                .tunnel_authority = authority,
             });
         }
         return routes.toOwnedSlice(allocator);
