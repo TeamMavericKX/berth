@@ -58,6 +58,11 @@ Set `BERTH_TOKEN=<secret>` when running `berth serve` to additionally
 require `Authorization: Bearer <secret>` on every mutation; agents can
 pass it with `curl -H "Authorization: Bearer $BERTH_TOKEN"`.
 
+## Docs
+
+- [Human guide](docs/guide.md) — five minutes, start to leaving-clean
+- [Agent contract](docs/agents.md) — markdown endpoint, URL scheme, safe mutation patterns
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
