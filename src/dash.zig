@@ -442,7 +442,10 @@ pub fn originAllowed(origin: ?[]const u8) bool {
         return std.mem.eql(u8, host[0 .. close + 1], "[::1]");
     }
     if (std.mem.indexOfScalar(u8, host, ':')) |colon| host = host[0..colon];
-    return std.mem.eql(u8, host, "localhost") or std.mem.eql(u8, host, "127.0.0.1") or std.mem.eql(u8, host, "::1");
+    inline for (.{ "localhost", "127.0.0.1", "::1", "berth.localhost", "berth" }) |ok| {
+        if (std.mem.eql(u8, host, ok)) return true;
+    }
+    return false;
 }
 
 fn headerValue(request: *http.Server.Request, name: []const u8) ?[]const u8 {
@@ -615,12 +618,16 @@ test "origin allowlist admits loopback and rejects everything else" {
     try std.testing.expect(originAllowed("https://127.0.0.1"));
     try std.testing.expect(originAllowed("http://127.0.0.1:3000"));
     try std.testing.expect(originAllowed("https://[::1]:8817"));
+    try std.testing.expect(originAllowed("http://berth.localhost:8090"));
+    try std.testing.expect(originAllowed("http://berth:8090"));
 
     try std.testing.expect(!originAllowed("http://evil.com"));
     try std.testing.expect(!originAllowed("https://evil.com:8080"));
     // Suffix tricks must never pass as loopback.
     try std.testing.expect(!originAllowed("http://localhost.evil.com"));
     try std.testing.expect(!originAllowed("http://127.0.0.1.evil.com"));
+    try std.testing.expect(!originAllowed("http://berth.localhost.evil.com"));
+    try std.testing.expect(!originAllowed("http://berth.evil.com"));
     try std.testing.expect(!originAllowed("not-a-url"));
     try std.testing.expect(!originAllowed(""));
 }
