@@ -53,7 +53,10 @@ pub fn ensureLeaf(io: std.Io, gpa: std.mem.Allocator, dir: []const u8, hostname:
     if (!fileExists(io, p.ca_crt) or !fileExists(io, p.ca_key)) {
         _ = runOpenssl(io, gpa, &.{ "ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", p.ca_key }) catch |err| return err;
         const ca_ok = runOpenssl(io, gpa, &.{ "req", "-x509", "-new", "-key", p.ca_key, "-sha256", "-days", "825", "-subj", "/CN=berth local CA/O=berth", "-out", p.ca_crt }) catch |err| return err;
-        if (!ca_ok) return Error.OpensslFailed;
+        if (!ca_ok) {
+            reportLastFailure(gpa);
+            return Error.OpensslFailed;
+        }
     } else if (!caValid(io, gpa, p)) {
         // Regenerate the whole CA rather than risk mixed identities.
         std.Io.Dir.deleteFileAbsolute(io, p.ca_crt) catch {};
@@ -129,31 +132,44 @@ fn writeFile(io: std.Io, path: []const u8, content: []const u8) void {
 }
 
 /// Spawn openssl and swallow its output. Returns true on exit 0.
+/// Stderr of the most recent failed openssl invocation; owned here so
+/// callers can surface a real diagnosis instead of a bare exit code.
+pub var last_failure_output: ?[]u8 = null;
+
 fn runOpenssl(io: std.Io, gpa: std.mem.Allocator, argv: []const []const u8) !bool {
     var full: std.ArrayList([]const u8) = .empty;
     defer full.deinit(gpa);
     full.append(gpa, openssl_bin) catch return Error.OpensslFailed;
     full.appendSlice(gpa, argv) catch return Error.OpensslFailed;
 
-    // Silence the child completely: inherited stdio would inject
-    // bytes into whatever protocol stream owns our fds (the test
-    // runner under zig build, a daemon later) and corrupt it.
-    var child = std.process.spawn(io, .{
-        .argv = full.items,
-        .stdin = .close,
-        .stdout = .close,
-        .stderr = .close,
-    }) catch |err| switch (err) {
+    // run() pipes both streams (stdin ignored): nothing we spawn can
+    // inject bytes into whatever protocol stream owns our fds, and
+    // failures keep their actual stderr for diagnosis.
+    const result = std.process.run(gpa, io, .{ .argv = full.items }) catch |err| switch (err) {
         error.FileNotFound => return Error.OpensslMissing,
         else => return Error.OpensslFailed,
     };
-    // Inherit stdout/stderr so failures surface in serve logs only when
-    // BERTH_LOG asks... spawn has no quiet option; redirect by closing?
-    const term = child.wait(io) catch return Error.OpensslFailed;
-    return switch (term) {
+    defer gpa.free(result.stdout);
+    const ok = switch (result.term) {
         .exited => |code| code == 0,
         else => false,
     };
+    if (ok) {
+        gpa.free(result.stderr);
+    } else {
+        if (last_failure_output) |prev| gpa.free(prev);
+        last_failure_output = result.stderr;
+    }
+    return ok;
+}
+
+/// Print and release the stashed failure output. Call at error sites.
+pub fn reportLastFailure(gpa: std.mem.Allocator) void {
+    if (last_failure_output) |s| {
+        std.debug.print("openssl said:\n{s}", .{s});
+        gpa.free(s);
+        last_failure_output = null;
+    }
 }
 
 test "paths assemble per host without clobbering ca names" {
